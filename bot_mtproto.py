@@ -2,10 +2,12 @@
 """Thesaurus Collector — Telegram Collector (MTProto/Telethon)
    Читает публичные каналы без вступления.
    Собирает тексты ≥50 слов и отправляет в назначенный канал."""
-import asyncio, logging, os, re, sqlite3, sys
+import asyncio, logging, os, re, sqlite3, sys, hashlib
 from datetime import datetime
 from pathlib import Path
 from telethon import TelegramClient, errors, events, functions
+
+MAX_TEXT_DUPLICATES = 3  # сколько раз можно сохранить один и тот же текст
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
@@ -51,6 +53,9 @@ conn.execute("""CREATE TABLE IF NOT EXISTS scrape_queue (
     total_saved INTEGER DEFAULT 0, error TEXT)""")
 conn.execute("""CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+# Таблица для подсчёта дубликатов текстов (ключ — sha256 content)
+conn.execute("""CREATE TABLE IF NOT EXISTS text_hashes (
+    hash TEXT PRIMARY KEY, count INTEGER DEFAULT 1)""")
 conn.commit()
 
 def wc(text): return len(text.split())
@@ -110,11 +115,24 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
         log.debug("⏭️ Пропущен текст (нет ключевых слов): %d слов из %s", wc(content), chat_title)
         return False
     
+    # Дедупликация: одинаковый текст сохраняем максимум MAX_TEXT_DUPLICATES раз
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    row = conn.execute("SELECT count FROM text_hashes WHERE hash=?", (content_hash,)).fetchone()
+    if row:
+        if row[0] >= MAX_TEXT_DUPLICATES:
+            log.debug("⏭️ Дубликат #%d (макс %d): %d слов из %s", row[0] + 1, MAX_TEXT_DUPLICATES, wc(content), chat_title)
+            return False
+        conn.execute("UPDATE text_hashes SET count=count+1 WHERE hash=?", (content_hash,))
+        dup_num = row[0] + 1
+    else:
+        conn.execute("INSERT INTO text_hashes (hash,count) VALUES (?,1)", (content_hash,))
+        dup_num = 1
+    
     words = wc(content)
     conn.execute("INSERT INTO texts (content,source_chat,source_chat_title,source_message_id,source_link,word_count) VALUES (?,?,?,?,?,?)",
                  (content, chat_id, chat_title, msg_id, link, words))
     conn.commit()
-    log.info("💾 %d слов из %s | канал #%s", words, chat_title, chat_id)
+    log.info("💾 %d слов из %s | канал #%s (дубль %d/%d)", words, chat_title, chat_id, dup_num, MAX_TEXT_DUPLICATES)
     return True
 
 session_path = str(DATA_DIR / "mt_session")
