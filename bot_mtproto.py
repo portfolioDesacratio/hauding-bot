@@ -107,8 +107,9 @@ async def send_to_output(text, source_title, source_link=None):
         log.warning("Не отправилось в канал: %s", e)
 
 # ─── Обработчик новых сообщений (только входящие) ───────────────────
-@client.on(events.NewMessage(incoming=True))
+@client.on(events.NewMessage)
 async def on_msg(event):
+    if event.out: return  # Не обрабатываем свои сообщения
     global _scanning
     msg = event.message; chat = await event.get_chat()
     title = getattr(chat, "title", None) or getattr(chat, "username", None) or "?"
@@ -183,7 +184,7 @@ def is_owner(event):
     return event.sender_id == OWNER_ID
 
 # ─── Команды (только для владельца) ──────────────────────────────────
-@client.on(events.NewMessage(pattern=r"^/start$", incoming=True))
+@client.on(events.NewMessage(pattern=r"^/start$"))
 async def cmd_start(event):
     await safe_send(event.chat_id,
         "👋 <b>Thesaurus Collector</b>\n\n"
@@ -200,7 +201,7 @@ async def cmd_start(event):
         "/pause — пауза\n"
         "/resume — продолжить")
 
-@client.on(events.NewMessage(pattern=r"^/stats$", incoming=True))
+@client.on(events.NewMessage(pattern=r"^/stats$"))
 async def cmd_stats(event):
     if not is_owner(event): return
     total = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
@@ -217,7 +218,7 @@ async def cmd_stats(event):
         f"Каналы: ✅ {qd} готово, 🔄 {qa} active, ⏳ {qp} в очереди\n"
         f"📤 Канал вывода: {'✅ ID ' + str(out) if out else '❌ не назначен'}")
 
-@client.on(events.NewMessage(pattern=r"^/add (.+)", incoming=True))
+@client.on(events.NewMessage(pattern=r"^/add (.+)"))
 async def cmd_add(event):
     if not is_owner(event): return
     raw = event.pattern_match.group(1).strip().lower()
@@ -244,7 +245,7 @@ async def cmd_add(event):
     except Exception as e:
         await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
 
-@client.on(events.NewMessage(pattern=r"^/queue$", incoming=True))
+@client.on(events.NewMessage(pattern=r"^/queue$"))
 async def cmd_queue(event):
     if not is_owner(event): return
     rows = conn.execute("SELECT username,title,status,total_saved FROM scrape_queue ORDER BY added_at DESC LIMIT 30").fetchall()
@@ -255,7 +256,7 @@ async def cmd_queue(event):
         lines.append(f"{emoji.get(s,'❓')} @{u} — {t or u}" + (f" ({sv})" if sv else ""))
     await safe_send(event.chat_id, "\n".join(lines))
 
-@client.on(events.NewMessage(pattern=r"^/search (.+)", incoming=True))
+@client.on(events.NewMessage(pattern=r"^/search (.+)"))
 async def cmd_search(event):
     if not is_owner(event): return
     q = event.pattern_match.group(1)
@@ -266,7 +267,7 @@ async def cmd_search(event):
         lines.append(f"#{pid} | {src or '?'} | {wc} слов\n<i>{prev[:150]}</i>\n")
     await safe_send(event.chat_id, "\n".join(lines))
 
-@client.on(events.NewMessage(pattern=r"^/export$", incoming=True))
+@client.on(events.NewMessage(pattern=r"^/export$"))
 async def cmd_export(event):
     if not is_owner(event): return
     rows = conn.execute("SELECT content,source_chat_title,collected_at FROM texts ORDER BY id").fetchall()
@@ -279,7 +280,7 @@ async def cmd_export(event):
     await client.send_file(event.chat_id, str(tmp))
     tmp.unlink()
 
-@client.on(events.NewMessage(pattern=r"^/set_output$", incoming=True))
+@client.on(events.NewMessage(pattern=r"^/set_output$"))
 async def cmd_set_output(event):
     if not is_owner(event): return
     chat = await event.get_chat()
@@ -289,13 +290,13 @@ async def cmd_set_output(event):
     await safe_send(event.chat_id,
         f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
 
-@client.on(events.NewMessage(pattern=r"^/pause$", incoming=True))
+@client.on(events.NewMessage(pattern=r"^/pause$"))
 async def cmd_pause(event):
     if not is_owner(event): return
     global _scanning; _scanning = False
     await safe_send(event.chat_id, "⏸ Пауза.")
 
-@client.on(events.NewMessage(pattern=r"^/resume$", incoming=True))
+@client.on(events.NewMessage(pattern=r"^/resume$"))
 async def cmd_resume(event):
     if not is_owner(event): return
     global _scanning; _scanning = True
