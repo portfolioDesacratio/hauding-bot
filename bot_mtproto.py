@@ -324,10 +324,8 @@ async def send_to_output(text, source_title, source_link=None):
             await asyncio.sleep(wait)
         _last_send_time = asyncio.get_event_loop().time()
 
-    header = f"📡 <b>{source_title}</b>"
-    if source_link: header += f"\n🔗 {source_link}"
     text_clean = text.replace("<", "&lt;").replace(">", "&gt;")
-    message = f"{header}\n\n{text_clean}"
+    message = text_clean
     if len(message) > 3950:
         message = message[:3950] + "\n\n✂️ ..."
     try:
