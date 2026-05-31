@@ -66,7 +66,8 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     log.info("💾 %d слов из %s", words, chat_title)
     return True
 
-client = TelegramClient("mt_session", API_ID, API_HASH)
+session_path = str(DATA_DIR / "mt_session")
+client = TelegramClient(session_path, API_ID, API_HASH)
 RE_LINK = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_+\-]{3,})')
 _scanning = True
 
