@@ -536,8 +536,8 @@ async def on_msg(event):
                 fn = msg.file.name or "unknown.txt"
                 if not (fn.endswith(".txt") or "text/plain" in (msg.file.mime_type or "")):
                     return
-                fb = await msg.download_media(bytes=True)
-                if not fb: fb = await client.download_file(msg.document, bytes=True)
+                fb = await msg.download_media(file=bytes)
+                if not fb: fb = await client.download_file(msg.document, file=bytes)
                 text_content = fb.decode("utf-8", errors="replace")
                 
                 # Если файл прислал владелец в ЛС — broadcast частями
