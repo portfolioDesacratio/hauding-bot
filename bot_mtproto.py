@@ -386,6 +386,61 @@ async def send_to_output(text, source_title=None, source_link=None):
         except Exception as e:
             log.warning("Не отправилось в канал: %s", e)
 
+# ─── Broadcast .txt файла частями в канал ──────────────────────────
+async def broadcast_file(text, filename, event):
+    """Разбивает текст на части по ~600 слов и отправляет в канал с интервалом ~4с"""
+    global _last_send_time
+    words = text.split()
+    total = len(words)
+    chunk_size = 600
+    chunks = []
+    for i in range(0, total, chunk_size):
+        chunks.append(" ".join(words[i:i + chunk_size]))
+    
+    total_chunks = len(chunks)
+    date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    
+    out = get_output_chat()
+    if not out:
+        await safe_send(event.chat_id, "❌ Канал вывода не назначен.")
+        return
+    
+    if total_chunks == 1:
+        # Одна часть — через обычный send (с rate limit)
+        await send_to_output(text, filename)
+        await safe_send(event.chat_id, f"✅ {filename} ({total} слов) отправлен.")
+        return
+    
+    await safe_send(event.chat_id, f"📤 Начинаю broadcast {filename} — {total_chunks} частей по ~{chunk_size} слов, каждые 4с.")
+    
+    for i, chunk in enumerate(chunks, 1):
+        header = f"[{date_str}] [{filename}] {i}/{total_chunks}"
+        text_clean = chunk.replace("<", "&lt;").replace(">", "&gt;")
+        message = f"{header}\n\n{text_clean}"
+        if len(message) > 3950:
+            message = message[:3950] + "\n\n✂️ ..."
+        
+        # Используем тот же lock, что и send_to_output — не конфликтует
+        async with _send_lock:
+            now = asyncio.get_event_loop().time()
+            since_last = now - _last_send_time
+            if since_last < 3.0:
+                await asyncio.sleep(3.0 - since_last)
+            try:
+                await client.send_message(out, message, parse_mode="html")
+                _last_send_time = asyncio.get_event_loop().time()
+                log.info("📤 Broadcast %s %d/%d", filename, i, total_chunks)
+            except errors.FloodWaitError as e:
+                log.warning("⏳ FloodWait broadcast: %dс", e.seconds)
+                await asyncio.sleep(min(e.seconds, 10))
+            except Exception as e:
+                log.warning("Broadcast ошибка: %s", e)
+        
+        if i < total_chunks:
+            await asyncio.sleep(1)  # +3s rate limit = ~4s между частями
+    
+    await safe_send(event.chat_id, f"✅ Broadcast {filename} завершён ({total_chunks} частей).")
+
 # ─── Проверка владельца ──────────────────────────────────────────────
 def is_owner(event):
     return event.sender_id == OWNER_ID
@@ -464,10 +519,17 @@ async def on_msg(event):
                 if fn.endswith(".txt") or "text/plain" in (msg.file.mime_type or ""):
                     fb = await msg.download_media(bytes=True)
                     if not fb: fb = await client.download_file(msg.document, bytes=True)
-                    for b in re.split(r'\n\s*\n', fb.decode("utf-8", errors="replace")):
-                        if wc(b) >= MIN_WORDS:
-                            if save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
-                                await send_to_output(b.strip(), title, f"file:{fn}")
+                    text_content = fb.decode("utf-8", errors="replace")
+                    
+                    # Если файл прислал владелец в ЛС — broadcast частями
+                    if event.is_private and event.sender_id == OWNER_ID:
+                        await broadcast_file(text_content, fn, event)
+                    else:
+                        # Старое поведение: абзацы в базу
+                        for b in re.split(r'\n\s*\n', text_content):
+                            if wc(b) >= MIN_WORDS:
+                                if save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
+                                    await send_to_output(b.strip(), title, f"file:{fn}")
             except Exception as e:
                 log.error("Файл: %s", e)
     except Exception as e:
