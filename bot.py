@@ -25,7 +25,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 IS_RENDER = os.getenv("RENDER") == "true"
 RENDER_URL = os.getenv("RENDER_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 RENDER_URL = RENDER_URL.rstrip("/")
-WEBHOOK_URL = f"{RENDER_URL}/webhook" if RENDER_URL else None
+# PTB's run_webhook listens on the root path (/) by default
+WEBHOOK_URL = RENDER_URL if RENDER_URL else None
 PORT = int(os.getenv("PORT", 8080))
 
 if not BOT_TOKEN: log.error("Задай BOT_TOKEN"); sys.exit(1)
