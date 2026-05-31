@@ -7,11 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py .
 
-# Для данных
-VOLUME ["/app/data"]
-
-# Render даёт PORT через переменную окружения
-ENV HOST=0.0.0.0
-EXPOSE 8080
+# Render монтирует постоянный диск в /app/data
 
 CMD ["python", "bot_mtproto.py"]
