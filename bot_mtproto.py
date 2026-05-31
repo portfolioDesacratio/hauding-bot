@@ -219,7 +219,16 @@ async def cmd_start(event):
             "/export — скачать всё\n"
             "/set_output [@канал] — назначить канал вывода\n"
             "/pause — пауза\n"
-            "/resume — продолжить")
+            "/resume — продолжить\n\n"
+            "🔍 Поиск каналов (user-клиент):\n"
+            "/auth — авторизовать user-клиент\n"
+            "/phone +7... — номер телефона\n"
+            "/code 12345 — код из Telegram\n"
+            "/2fa пароль — пароль 2FA\n"
+            "/search_channels запрос — поиск каналов\n"
+            "/searchwords слово1, слово2 — ключевые слова\n"
+            "/autosearch on|off — автопоиск каждые 6ч\n"
+            "/logout_user — удалить сессию")
     except Exception as e:
         log.exception("cmd_start: %s", e)
 
@@ -434,6 +443,17 @@ def register_handlers():
     client.add_event_handler(cmd_pause, events.NewMessage(pattern=r"^/pause$"))
     client.add_event_handler(cmd_resume, events.NewMessage(pattern=r"^/resume$"))
 
+    # User client команды
+    client.add_event_handler(cmd_auth, events.NewMessage(pattern=r"^/auth$"))
+    client.add_event_handler(cmd_phone, events.NewMessage(pattern=r"^/phone\s+(.+)"))
+    client.add_event_handler(cmd_code, events.NewMessage(pattern=r"^/code\s+(.+)"))
+    client.add_event_handler(cmd_2fa, events.NewMessage(pattern=r"^/2fa\s+(.+)"))
+    client.add_event_handler(cmd_search_channels, events.NewMessage(pattern=r"^/search_channels?\s+(.+)"))
+    client.add_event_handler(cmd_autosearch, events.NewMessage(pattern=r"^/autosearch\s+(.+)"))
+    client.add_event_handler(cmd_searchwords, events.NewMessage(pattern=r"^/searchwords?\s+(.+)"))
+    # Удалить user_client + отвязать (если нужно переавторизоваться)
+    client.add_event_handler(cmd_logout_user, events.NewMessage(pattern=r"^/logout_user$"))
+
     eb_count = len(client._event_builders) if hasattr(client, '_event_builders') else 0
     log.info("✅ Зарегистрировано хендлеров: %d", eb_count)
 
@@ -513,8 +533,49 @@ async def queue_worker():
 async def add_seed_channels():
     log.info("📡 Добавляю начальные каналы...")
     seed_channels = [
+        # --- Крупнейшие СМИ ---
         "rian_ru", "tass_agency", "rt_russian", "rbc_news",
         "meduzalive", "lentadnya", "varlamov",
+        "moscowmap", "izvestia", "kommersant", "vedomosti",
+        "fontanka", "novayagazeta", "theinsider",
+        "bbcrussian", "dw_russian", "svoboda_radio",
+        "nastoyaschee", "currenttime", "krymrealii",
+        "kavkaz_realii", "sibir_realii", "idelreal",
+        "golosameriki", "euronews_ru", "russian_rt",
+        "tvrain", "dozhd", "znak_com", "ura_ru",
+        "mk_ru", "kp_ru", "life_news", "lifenews_78",
+        "breakingmash", "mash", "mashnews",
+        "baza", "bazabazon", "readovkanews",
+        "ostorozhno_novosti", "projury", "sotaproject",
+        # --- Политика / аналитика ---
+        "navalny", "teamnavalny", "navalny_fb", "navalnyinfobot",
+        "fbk_info", "alexei_navalny", "navalnycom",
+        "nemtsov_fond", "khodorkovsky", "mbkmedia",
+        "novayagazeta_eu", "mediazona", "zona_media",
+        "ovdinfo", "pchikov", "svetov_m",
+        "egor_chemessi", "stanovaya", "faridaily",
+        "katz", "max_katz", "katz_eng",
+        "ponomarev", "belkovskiy", "shein_official",
+        # --- Экономика ---
+        "rbc_money", "banki_ru", "smartlab", "fincult",
+        "moscowexchange", "cbr_ru", "minfin_ru",
+        "elly_ru", "openfinance", "frank_media",
+        "inventure_ru", "proeconomics",
+        # --- Технологии ---
+        "roem_ru", "habr_com", "tproger", "dtf",
+        "iguides", "android_ru", "apple_news",
+        "techdays", "codernet", "itmozg",
+        # --- Коррупция / расследования ---
+        "meduzalive", "istories_media", "agentstvonews",
+        "dossier_center", "projectmedia", "bellingcat",
+        "insider_ru", "thebell_io", "yabloko_ru",
+        # --- Регионы ---
+        "krym_24", "crimea_news", "crimea_realii",
+        "kavkaz_knot", "kavkazr", "kuban_24",
+        "ural_news", "sibir_news", "dalnijvostok",
+        "spb_news", "spb_sobiratel", "fontanka_spb",
+        "msk_news", "moslenta", "mosgorsud",
+        "podmoskovie", "nso_news", "tatarstan",
     ]
     added = 0
     for ch in seed_channels:
@@ -530,6 +591,265 @@ async def add_seed_channels():
         except Exception as e:
             log.warning("  ⚠️ @%s: %s", ch, e)  # warning, not debug, чтобы видеть
     log.info("📡 Добавлено %d начальных каналов", added)
+
+# ─── User‑клиент (твой аккаунт) для Search API ───────────────────────
+USER_SESSION = str(DATA_DIR / "user_session")
+user_client = None
+
+def get_user_client():
+    global user_client
+    if user_client is None:
+        user_client = TelegramClient(USER_SESSION, API_ID, API_HASH)
+    return user_client
+
+async def init_user_client():
+    """Проверяем сохранённую сессию при старте"""
+    uc = get_user_client()
+    try:
+        await uc.connect()
+        if await uc.is_user_authorized():
+            log.info("👤 User client авторизован (сессия сохранена)")
+            asyncio.create_task(user_searcher())
+            return True
+        else:
+            log.info("👤 User client: сессия недействительна, нужна /auth")
+            return False
+    except Exception as e:
+        log.debug("User client init: %s", e)
+        return False
+
+DEFAULT_SEARCH_KEYWORDS = (
+    "новости, политика, война, украина, санкции, экономика, расследования, "
+    "коррупция, выборы, деньги, нефть, газ, кризис, троллинг, фейки, "
+    "пропаганда, медиа, телеграм, каналы, блогеры, оппозиция, власть, "
+    "кремль, путин, навальный, немцов, беларусь, кавказ, сибирь"
+)
+
+async def cmd_auth(event):
+    if not is_owner(event): return
+    uc = get_user_client()
+    try:
+        if await uc.is_user_authorized():
+            await safe_send(event.chat_id, "✅ User client уже авторизован.")
+            return
+    except:
+        await uc.disconnect()
+        await uc.connect()
+    phone = conn.execute("SELECT value FROM config WHERE key='user_phone'").fetchone()
+    await safe_send(event.chat_id,
+        "📱 Отправь номер телефона:\n"
+        "/phone +79876543210\n\n"
+        f"{'👉 У тебя уже сохранён: ' + phone[0] if phone else ''}")
+
+async def cmd_phone(event):
+    if not is_owner(event): return
+    phone = event.pattern_match.group(1).strip()
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_phone", phone))
+    conn.commit()
+    uc = get_user_client()
+    await uc.connect()
+    try:
+        await uc.send_code_request(phone)
+        await safe_send(event.chat_id, f"✅ Код отправлен на {phone}\nВведи код: /code 12345")
+    except errors.FloodWaitError as e:
+        await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
+    except Exception as e:
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+
+async def cmd_code(event):
+    if not is_owner(event): return
+    code = event.pattern_match.group(1).strip()
+    phone_row = conn.execute("SELECT value FROM config WHERE key='user_phone'").fetchone()
+    if not phone_row:
+        await safe_send(event.chat_id, "❌ Сначала /phone")
+        return
+    phone = phone_row[0]
+    uc = get_user_client()
+    if not uc.is_connected():
+        await uc.connect()
+    try:
+        await uc.sign_in(phone, code)
+        await safe_send(event.chat_id, "✅ User client авторизован! Поиск каналов работает.\n"
+            "Поставь ключевые слова: /searchwords слово1, слово2\n"
+            "Включи автопоиск: /autosearch on")
+        asyncio.create_task(user_searcher())
+    except errors.SessionPasswordNeededError:
+        await safe_send(event.chat_id, "🔑 Нужен пароль 2FA: /2fa твой_пароль")
+    except errors.FloodWaitError as e:
+        await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
+    except errors.PhoneCodeInvalidError:
+        await safe_send(event.chat_id, "❌ Неверный код. Попробуй ещё: /code 12345")
+    except Exception as e:
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+
+async def cmd_2fa(event):
+    if not is_owner(event): return
+    password = event.pattern_match.group(1).strip()
+    uc = get_user_client()
+    if not uc.is_connected():
+        await uc.connect()
+    try:
+        await uc.sign_in(password=password)
+        await safe_send(event.chat_id, "✅ User client авторизован (2FA)! Поиск работает.\n"
+            "Ключевые слова: /searchwords слово1, слово2\n"
+            "Автопоиск: /autosearch on")
+        asyncio.create_task(user_searcher())
+    except errors.FloodWaitError as e:
+        await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
+    except Exception as e:
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+
+async def cmd_search_channels(event):
+    if not is_owner(event): return
+    q = event.pattern_match.group(1).strip()
+    uc = get_user_client()
+    try:
+        if not await uc.is_user_authorized():
+            await safe_send(event.chat_id, "❌ User client не авторизован. Сначала /auth")
+            return
+    except:
+        await safe_send(event.chat_id, "❌ User client не готов. Сначала /auth")
+        return
+    if not uc.is_connected():
+        await uc.connect()
+    try:
+        result = await uc(functions.contacts.SearchRequest(q=q, limit=30))
+        channels = [c for c in result.chats if hasattr(c, 'title') and getattr(c, 'username', None)]
+        if not channels:
+            await safe_send(event.chat_id, f"🔍 По запросу «{q}» каналы не найдены.")
+            return
+        added = 0
+        msg = [f"🔍 <b>{q}</b> — найдено {len(channels)} каналов:\n"]
+        for ch in channels:
+            username = ch.username.lower()
+            exists = conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone()
+            if not exists:
+                title = ch.title or username
+                conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (username, title))
+                conn.commit()
+                added += 1
+            msg.append(f"{'➕' if not exists else '✅'} @{username} — {ch.title or ''}")
+        conn.commit()
+        msg.append(f"\nНовых добавлено: {added}")
+        await safe_send(event.chat_id, "\n".join(msg))
+    except errors.FloodWaitError as e:
+        await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
+    except Exception as e:
+        await safe_send(event.chat_id, f"❌ Ошибка поиска: {str(e)[:200]}")
+
+async def cmd_autosearch(event):
+    if not is_owner(event): return
+    raw = event.pattern_match.group(1).strip().lower()
+    if raw in ("on", "вкл", "да", "yes", "1"):
+        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", "on"))
+        conn.commit()
+        await safe_send(event.chat_id, "✅ Автопоиск включён. Каждые 6 часов бот ищет новые каналы.")
+        asyncio.create_task(user_searcher())
+    elif raw in ("off", "выкл", "нет", "no", "0"):
+        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", "off"))
+        conn.commit()
+        await safe_send(event.chat_id, "⏸ Автопоиск выключен.")
+    elif raw == "status":
+        st = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
+        kws = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
+        authed = False
+        try:
+            uc = get_user_client()
+            authed = await uc.is_user_authorized()
+        except:
+            pass
+        await safe_send(event.chat_id,
+            f"👤 User client: {'✅ авторизован' if authed else '❌ не авторизован'}\n"
+            f"🔍 Автопоиск: {'✅ вкл' if st and st[0] == 'on' else '❌ выкл'}\n"
+            f"📝 Слова: {kws[0] if kws else 'не заданы'}")
+    else:
+        await safe_send(event.chat_id, "❌ /autosearch on|off|status")
+
+async def cmd_searchwords(event):
+    if not is_owner(event): return
+    words = event.pattern_match.group(1).strip()
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_search_keywords", words))
+    conn.commit()
+    await safe_send(event.chat_id, f"✅ Ключевые слова сохранены:\n{words}")
+
+async def user_searcher():
+    """Фоновая задача: ищет каналы по ключевым словам каждые 6 часов"""
+    uc = get_user_client()
+    try:
+        if not await uc.is_user_authorized():
+            log.info("👤 User client не авторизован — автопоиск не запущен")
+            return
+    except:
+        return
+    log.info("👤 User searcher запущен")
+    while True:
+        try:
+            autosearch = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
+            if not autosearch or autosearch[0] != "on":
+                await asyncio.sleep(3600)
+                continue
+            kws_row = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
+            if not kws_row:
+                # Устанавливаем ключевые слова по умолчанию
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                             ("user_search_keywords", DEFAULT_SEARCH_KEYWORDS))
+                conn.commit()
+                kws_row = (DEFAULT_SEARCH_KEYWORDS,)
+            keywords = [k.strip() for k in kws_row[0].split(",") if k.strip()]
+            if not keywords:
+                await asyncio.sleep(3600)
+                continue
+            log.info("🔍 Ищу каналы по %d ключевым словам...", len(keywords))
+            if not uc.is_connected():
+                await uc.connect()
+            total_found = 0
+            for kw in keywords:
+                try:
+                    result = await uc(functions.contacts.SearchRequest(q=kw, limit=20))
+                    for ch in result.chats:
+                        if hasattr(ch, 'title') and getattr(ch, 'username', None):
+                            username = ch.username.lower()
+                            if not conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone():
+                                title = ch.title or username
+                                conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)",
+                                             (username, title))
+                                conn.commit()
+                                total_found += 1
+                                log.info("  🔍 +@%s (%s) по запросу «%s»", username, title, kw)
+                    await asyncio.sleep(15)
+                except errors.FloodWaitError as e:
+                    log.warning("FloodWait user search: %dс", e.seconds)
+                    await asyncio.sleep(min(e.seconds, 300))
+                except Exception as e:
+                    log.warning("Ошибка поиска «%s»: %s", kw, e)
+            log.info("🔍 Цикл поиска завершён. Добавлено %d каналов. Следующий через 6ч.", total_found)
+            await asyncio.sleep(6 * 3600)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.exception("user_searcher: %s", e)
+            await asyncio.sleep(300)
+
+async def cmd_logout_user(event):
+    if not is_owner(event): return
+    uc = get_user_client()
+    try:
+        await uc.log_out()
+    except:
+        pass
+    try:
+        await uc.disconnect()
+    except:
+        pass
+    # Удаляем файл сессии
+    for f in (DATA_DIR / "user_session.session", DATA_DIR / "user_session.session-journal"):
+        if f.exists():
+            f.unlink()
+    global user_client
+    user_client = None
+    conn.execute("DELETE FROM config WHERE key='user_phone'")
+    conn.commit()
+    await safe_send(event.chat_id, "✅ User client отвязан. Сессия удалена.")
 
 # ─── Главный запуск ──────────────────────────────────────────────────
 async def main():
@@ -554,6 +874,7 @@ async def main():
     # Фоновые задачи
     asyncio.create_task(heartbeat())
     asyncio.create_task(queue_worker())
+    asyncio.create_task(init_user_client())
     total_q = conn.execute("SELECT COUNT(*) FROM scrape_queue").fetchone()[0]
     if total_q == 0:
         asyncio.create_task(add_seed_channels())
