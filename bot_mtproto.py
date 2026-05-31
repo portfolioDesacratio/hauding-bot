@@ -338,6 +338,27 @@ async def cmd_set_output(event):
             target = raw.strip()
             invite_code = None
 
+            # Это числовой ID канала? (-100...)
+            if re.match(r'^-?\d+$', target):
+                chat_id = int(target)
+                # Пробуем получить entity для проверки, но это может не сработать для бота
+                try:
+                    entity = await client.get_entity(chat_id)
+                    title = getattr(entity, "title", None) or getattr(entity, "username", None) or f"ID {chat_id}"
+                except Exception:
+                    # Всё равно сохраняем — бот может писать если он админ
+                    title = f"канал ID {chat_id}"
+                set_output_chat(chat_id)
+                await safe_send(event.chat_id,
+                    f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
+                # Пробуем отправить тестовое сообщение
+                try:
+                    await client.send_message(chat_id, "✅ Бот подключён. Начинаю сбор текстов.", parse_mode="html")
+                except Exception:
+                    await safe_send(event.chat_id,
+                        "⚠️ Бот не может писать в канал. Убедись, что он админ (с правом send messages).")
+                return
+
             # Это инвайт-ссылка? (t.me/+xxx)
             m = re.search(r't\.me/\+([a-zA-Z0-9_\-]+)', target)
             if m:
@@ -471,9 +492,19 @@ async def scrape_channel(username, resume_from=0):
     try:
         entity = await client.get_entity(username)
     except errors.UsernameNotOccupiedError:
+        conn.execute("UPDATE scrape_queue SET status='error',error='Username not found' WHERE username=?", (username,))
+        conn.commit()
+        log.warning("⚠️ @%s не найден (username not occupied)", username)
         return -1
+    except errors.FloodWaitError as e:
+        log.warning("FloodWait @%s: %dс", username, e.seconds)
+        await asyncio.sleep(min(e.seconds, 60))
+        return await scrape_channel(username, resume_from)
     except Exception as e:
-        log.warning("@%s: %s", username, e); return -1
+        conn.execute("UPDATE scrape_queue SET status='error',error=? WHERE username=?", (str(e)[:500], username))
+        conn.commit()
+        log.warning("⚠️ @%s ошибка: %s", username, e)
+        return -1
     title = getattr(entity, "title", None) or username
     saved = processed = 0; last_id = resume_from
     log.info("📡 @%s с msg#%d...", username, resume_from)
