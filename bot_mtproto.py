@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""TEAM SPIRIT — Telegram Collector (MTProto/Telethon)
-   Читает публичные каналы без вступления. Работает на Render.com."""
+"""Thesaurus Collector — Telegram Collector (MTProto/Telethon)
+   Читает публичные каналы без вступления.
+   Собирает тексты ≥50 слов и отправляет в назначенный канал."""
 import asyncio, logging, os, re, sqlite3, sys
 from datetime import datetime
 from pathlib import Path
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, errors, events, functions
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
-log = logging.getLogger("collector-mt")
+log = logging.getLogger("thesaurus")
 
 env_path = Path(__file__).parent / ".env"
 if env_path.exists():
@@ -25,7 +26,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not all([API_ID, API_HASH, BOT_TOKEN]):
     log.error("Задай API_ID, API_HASH, BOT_TOKEN в .env"); sys.exit(1)
 
-# Render auto‑detection
 IS_RENDER = os.getenv("RENDER") == "true"
 RENDER_URL = os.getenv("RENDER_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
 RENDER_URL = RENDER_URL.rstrip("/")
@@ -34,8 +34,6 @@ PORT = int(os.getenv("PORT", 8080))
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "collector.db"
-TEXT_OUTPUT = DATA_DIR / "collected_texts.txt"
-PRIVATE_FILE = DATA_DIR / "private_links.txt"
 MIN_WORDS = 50
 
 conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
@@ -50,9 +48,19 @@ conn.execute("""CREATE TABLE IF NOT EXISTS scrape_queue (
     added_at TEXT DEFAULT (datetime('now')),
     status TEXT DEFAULT 'pending', last_msg_id INTEGER DEFAULT 0,
     total_saved INTEGER DEFAULT 0, error TEXT)""")
+conn.execute("""CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
 conn.commit()
 
 def wc(text): return len(text.split())
+
+def get_output_chat():
+    row = conn.execute("SELECT value FROM config WHERE key='output_chat'").fetchone()
+    return int(row[0]) if row else None
+
+def set_output_chat(chat_id):
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("output_chat", str(chat_id)))
+    conn.commit()
 
 def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     content = content.strip()
@@ -61,8 +69,6 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     conn.execute("INSERT INTO texts (content,source_chat,source_chat_title,source_message_id,source_link,word_count) VALUES (?,?,?,?,?,?)",
                  (content, chat_id, chat_title, msg_id, link, words))
     conn.commit()
-    with open(TEXT_OUTPUT, "a", encoding="utf-8") as f:
-        f.write(f"=== {chat_title} | msg#{msg_id or '?'} | {words} слов | {datetime.now():%Y-%m-%d %H:%M} ===\n{content}\n\n")
     log.info("💾 %d слов из %s", words, chat_title)
     return True
 
@@ -71,24 +77,35 @@ client = TelegramClient(session_path, API_ID, API_HASH)
 RE_LINK = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_+\-]{3,})')
 _scanning = True
 
-# ─── Health‑check HTTP server (чтобы Render не уснул) ─────────────────
+# ─── Health‑check HTTP server (Render) ───────────────────────────────
 async def health_server():
-    """Minimal HTTP server – Render health checks keep the service alive."""
     async def handler(reader, writer):
-        request = b""
-        while b"\r\n\r\n" not in request:
-            chunk = await reader.read(1024)
-            if not chunk: break
-            request += chunk
-        # Respond 200 OK
-        response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
-        writer.write(response)
+        while b"\r\n\r\n" not in await reader.read(1024): pass
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok")
         await writer.drain()
         writer.close()
     server = await asyncio.start_server(handler, "0.0.0.0", PORT)
-    log.info("🏥 Health check server on 0.0.0.0:%d", PORT)
-    async with server:
-        await server.serve_forever()
+    log.info("🏥 Health check on 0.0.0.0:%d", PORT)
+    async with server: await server.serve_forever()
+
+# ─── Отправка текста в выходной канал ────────────────────────────────
+async def send_to_output(text, source_title, source_link=None):
+    """Отправляет собранный текст в назначенный канал"""
+    out = get_output_chat()
+    if not out: return
+    header = f"📡 <b>{source_title}</b>"
+    if source_link: header += f"\n🔗 {source_link}"
+    # Режем если слишком длинно (Telegram лимит 4096)
+    text_clean = text.replace("<", "&lt;").replace(">", "&gt;")
+    message = f"{header}\n\n{text_clean}"
+    # Telegram ограничение — 4096 символов
+    if len(message) > 3950:
+        message = message[:3950] + "\n\n✂️ ..."
+    try:
+        await client.send_message(out, message, parse_mode="html")
+        log.info("📤 Отправлено в канал #%d", out)
+    except Exception as e:
+        log.warning("Не отправилось в канал: %s", e)
 
 # ─── Обработчик новых сообщений ──────────────────────────────────────
 @client.on(events.NewMessage)
@@ -96,21 +113,22 @@ async def on_msg(event):
     global _scanning
     msg = event.message; chat = await event.get_chat()
     title = getattr(chat, "title", None) or getattr(chat, "username", None) or "?"
-    
-    # Сохраняем текст ≥50 слов
+    chat_id = event.chat_id
+
+    # Сохраняем и отправляем текст ≥50 слов
     if msg.text and wc(msg.text) >= MIN_WORDS:
         link = f"https://t.me/{chat.username}/{msg.id}" if getattr(chat,"username",None) else None
-        save_text(msg.text, title, str(chat.id), msg.id, link)
-    
+        if save_text(msg.text, title, str(chat.id), msg.id, link):
+            await send_to_output(msg.text, title, link)
+
     # Ищем ссылки на каналы
     if msg.text:
         for link in RE_LINK.findall(msg.text):
             link_lower = link.lower()
             if link_lower in ("bot","botfather","telegram","gif","sticker","premium"): continue
             if conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (link,)).fetchone(): continue
-            
+
             if link.startswith("+"):
-                # Приватный канал — пытаемся зайти
                 log.info("🔑 Пытаюсь зайти в %s из %s", link, title)
                 try:
                     await client.join_chat(link)
@@ -118,30 +136,26 @@ async def on_msg(event):
                     conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)",
                                  (link, f"private:{link}"))
                     conn.commit()
-                    await safe_send(chat.id, f"🔓 Зашёл в <code>t.me/{link}</code>")
                 except Exception as e:
                     log.warning("❌ Не зашёл в %s: %s", link, e)
-                    with open(PRIVATE_FILE, "a") as f:
+                    with open(DATA_DIR / "private_links.txt", "a") as f:
                         f.write(f"t.me/{link} | из {title} | {datetime.now()}\n")
                 continue
-            
-            # Публичный канал — добавляем в очередь
+
             try:
                 entity = await client.get_entity(link)
                 if not hasattr(entity, "title"): continue
                 t = getattr(entity, "title", None) or link
                 conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (link, t))
                 conn.commit()
-                log.info("➕ @%s (%s) в очередь на сканирование", link, t)
-                await safe_send(chat.id, f"📡 <b>{t}</b> (@{link}) в очереди на сканирование.")
-            except errors.UsernameNotOccupiedError:
-                pass
+                log.info("➕ @%s (%s) в очередь", link, t)
+            except errors.UsernameNotOccupiedError: pass
             except errors.FloodWaitError as e:
                 log.warning("FloodWait при get_entity: %dс", e.seconds)
                 await asyncio.sleep(e.seconds)
             except Exception as e:
                 log.debug("Не удалось получить @%s: %s", link, e)
-    
+
     # Файлы .txt
     if msg.document:
         try:
@@ -150,25 +164,40 @@ async def on_msg(event):
                 fb = await msg.download_media(bytes=True) or await client.download_file(msg.document, bytes=True)
                 for b in re.split(r'\n\s*\n', fb.decode("utf-8", errors="replace")):
                     if wc(b) >= MIN_WORDS:
-                        save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}")
-                await safe_send(chat.id, f"✅ {fn} обработан.")
-        except Exception as e:
-            log.error("Файл: %s", e)
+                        if save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
+                            await send_to_output(b.strip(), title, f"file:{fn}")
+        except Exception as e: log.error("Файл: %s", e)
+
+# ─── Добавление в чат / выход из чата ────────────────────────────────
+@client.on(events.ChatAction)
+async def on_chat_action(event):
+    """Когда бота добавляют в чат — запоминаем"""
+    if event.user_added and event.user_id and event.user_id == (await client.get_me()).id:
+        chat = await event.get_chat()
+        title = getattr(chat, "title", None) or "?"
+        log.info("➕ Добавлен в чат: %s (%d)", title, event.chat_id)
+        # Если это канал без username — это приватный канал, запоминаем
+        if not getattr(chat, "username", None):
+            conn.execute("INSERT OR IGNORE INTO config (key,value) VALUES (?,?)",
+                         ("chat_" + str(event.chat_id), title))
+            conn.commit()
 
 # ─── Команды ─────────────────────────────────────────────────────────
 @client.on(events.NewMessage(pattern=r"^/start$"))
 async def cmd_start(event):
     await safe_send(event.chat_id,
         "👋 <b>Thesaurus Collector</b>\n\n"
-        "Читаю публичные каналы без вступления.\n"
-        "Ищу ссылки в сообщениях, сканирую историю.\n"
+        "Собираю тексты <b>≥50 слов</b> из публичных каналов.\n"
+        "Нахожу новые каналы через ссылки в сообщениях.\n"
         "Пытаюсь зайти в закрытые чаты.\n\n"
         "Команды:\n"
         "/stats — статистика\n"
-        "/add <username> — добавить канал в очередь\n"
+        "/add <username> — добавить канал\n"
         "/queue — очередь каналов\n"
         "/search <слова> — поиск\n"
         "/export — скачать всё\n"
+        "/set_output — назначить этот чат для вывода\n"
+        "/scan — поиск новых каналов\n"
         "/pause — пауза\n"
         "/resume — продолжить")
 
@@ -180,11 +209,39 @@ async def cmd_stats(event):
     qd = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='done'").fetchone()[0]
     qp = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0]
     qa = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='active'").fetchone()[0]
+    out = get_output_chat()
     await safe_send(event.chat_id,
         f"📊 <b>Статистика</b>\n\n"
         f"Текстов: <b>{total}</b>\nСлов: <b>{words:,}</b>\n"
         f"За 24ч: <b>{today}</b>\n\n"
-        f"Каналы: ✅ {qd} готово, 🔄 {qa} active, ⏳ {qp} в очереди")
+        f"Каналы: ✅ {qd} готово, 🔄 {qa} active, ⏳ {qp} в очереди\n"
+        f"📤 Канал вывода: {'✅ ID ' + str(out) if out else '❌ не назначен'}")
+
+@client.on(events.NewMessage(pattern=r"^/add (.+)"))
+async def cmd_add(event):
+    raw = event.pattern_match.group(1).strip().lower()
+    username = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', raw).split('/')[0].split('?')[0]
+    if not username or username.startswith("+"):
+        await safe_send(event.chat_id, "❌ Приватная ссылка. Добавь бота в канал админом.")
+        return
+    if conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone():
+        await safe_send(event.chat_id, f"ℹ️ @{username} уже в очереди.")
+        return
+    try:
+        entity = await client.get_entity(username)
+        if not hasattr(entity, "title"):
+            await safe_send(event.chat_id, f"❌ @{username} — не канал.")
+            return
+        title = getattr(entity, "title", None) or username
+        conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (username, title))
+        conn.commit()
+        await safe_send(event.chat_id, f"📡 <b>{title}</b> (@{username}) добавлен в очередь.")
+    except errors.UsernameNotOccupiedError:
+        await safe_send(event.chat_id, f"❌ @{username} не существует.")
+    except errors.FloodWaitError as e:
+        await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
+    except Exception as e:
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
 
 @client.on(events.NewMessage(pattern=r"^/queue$"))
 async def cmd_queue(event):
@@ -208,9 +265,31 @@ async def cmd_search(event):
 
 @client.on(events.NewMessage(pattern=r"^/export$"))
 async def cmd_export(event):
-    if not TEXT_OUTPUT.exists(): await safe_send(event.chat_id, "❌ Пусто."); return
+    # Собираем все тексты из БД
+    rows = conn.execute("SELECT content,source_chat_title,collected_at FROM texts ORDER BY id").fetchall()
+    if not rows: await safe_send(event.chat_id, "❌ Пусто."); return
+    tmp = DATA_DIR / "export.txt"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for content, src, dt in rows:
+            f.write(f"=== {src or '?'} | {dt} ===\n{content}\n\n")
     await safe_send(event.chat_id, "📦 Отправляю...")
-    await client.send_file(event.chat_id, str(TEXT_OUTPUT))
+    await client.send_file(event.chat_id, str(tmp))
+    tmp.unlink()
+
+@client.on(events.NewMessage(pattern=r"^/set_output$"))
+async def cmd_set_output(event):
+    """Назначает текущий чат как канал для вывода собранных текстов"""
+    chat = await event.get_chat()
+    chat_id = event.chat_id
+    title = getattr(chat, "title", None) or getattr(chat, "username", None) or "этот чат"
+    set_output_chat(chat_id)
+    await safe_send(event.chat_id, f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
+
+@client.on(events.NewMessage(pattern=r"^/scan$"))
+async def cmd_scan(event):
+    """Поиск публичных каналов через Telegram search"""
+    await safe_send(event.chat_id, "🔍 Ищу публичные каналы... Это может занять минуту.")
+    asyncio.create_task(discover_channels(event.chat_id))
 
 @client.on(events.NewMessage(pattern=r"^/pause$"))
 async def cmd_pause(event):
@@ -222,37 +301,44 @@ async def cmd_resume(event):
     global _scanning; _scanning = True
     await safe_send(event.chat_id, "▶️ Продолжаем.")
 
-@client.on(events.NewMessage(pattern=r"^/add (.+)"))
-async def cmd_add(event):
-    """Добавить канал в очередь сканирования. /add username или t.me/username"""
-    raw = event.pattern_match.group(1).strip().lower()
-    # Извлекаем username из ссылки типа t.me/xxx, @xxx
-    username = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', raw).split('/')[0].split('?')[0]
-    if not username or username.startswith("+"):
-        await safe_send(event.chat_id, "❌ Это приватная ссылка. Добавь бота в канал админом.")
-        return
-    if conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone():
-        await safe_send(event.chat_id, f"ℹ️ @{username} уже в очереди.")
-        return
-    try:
-        entity = await client.get_entity(username)
-        if not hasattr(entity, "title"):
-            await safe_send(event.chat_id, f"❌ @{username} — не канал.")
-            return
-        title = getattr(entity, "title", None) or username
-        conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (username, title))
-        conn.commit()
-        await safe_send(event.chat_id, f"📡 <b>{title}</b> (@{username}) добавлен в очередь.")
-    except errors.UsernameNotOccupiedError:
-        await safe_send(event.chat_id, f"❌ @{username} не существует.")
-    except errors.FloodWaitError as e:
-        await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
-    except Exception as e:
-        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
-
 async def safe_send(chat_id, text, parse_mode="html"):
     try: await client.send_message(chat_id, text, parse_mode=parse_mode)
     except Exception as e: log.warning("Не отправилось: %s", e)
+
+# ─── Поиск каналов через поиск Telegram ──────────────────────────────
+SEED_QUERIES = [
+    "новости", "юмор", "мемы", "политика", "бизнес",
+    "криптовалюта", "каналы", "блог", "общение"
+]
+
+async def discover_channels(notify_chat=None):
+    """Ищет публичные каналы через search и добавляет в очередь"""
+    found = 0
+    for query in SEED_QUERIES:
+        if not _scanning: break
+        try:
+            result = await client(functions.contacts.SearchRequest(
+                q=query, limit=100
+            ))
+            for chat in result.chats:
+                if hasattr(chat, "username") and chat.username:
+                    uname = chat.username
+                    if conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (uname,)).fetchone():
+                        continue
+                    title = getattr(chat, "title", None) or uname
+                    conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (uname, title))
+                    conn.commit()
+                    found += 1
+            await asyncio.sleep(3)  # избегаем flood
+        except errors.FloodWaitError as e:
+            log.warning("FloodWait search: %dс", e.seconds)
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            log.error("Search error: %s", e)
+    if notify_chat:
+        await safe_send(notify_chat, f"🔍 Найдено <b>{found}</b> новых каналов. Они добавлены в очередь.")
+    log.info("🔍 Найдено %d каналов", found)
+    return found
 
 # ─── Сканирование истории канала ─────────────────────────────────────
 async def scrape_channel(username, resume_from=0):
@@ -269,7 +355,9 @@ async def scrape_channel(username, resume_from=0):
             processed += 1; last_id = msg.id
             if msg.text and wc(msg.text) >= MIN_WORDS:
                 link = f"https://t.me/{entity.username}/{msg.id}" if getattr(entity,"username",None) else None
-                save_text(msg.text, title, str(entity.id), msg.id, link); saved += 1
+                if save_text(msg.text, title, str(entity.id), msg.id, link):
+                    await send_to_output(msg.text, title, link)
+                saved += 1
             if processed % 500 == 0:
                 conn.execute("UPDATE scrape_queue SET last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                              (last_id, saved, username)); conn.commit()
@@ -306,21 +394,24 @@ async def main():
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     log.info("=" * 50)
-    log.info("🤖 @%s (MTProto) запущен", me.username or "?")
+    log.info("🤖 @%s запущен", me.username or "?")
     log.info("📁 База: %s", DB_PATH)
     if IS_RENDER:
         log.info("🌐 Render: %s | Health check на порту %d", RENDER_URL or "?", PORT)
     else:
-        log.info("🖥 Локальный режим (без health check)")
+        log.info("🖥 Локальный режим")
     log.info("=" * 50)
-    
-    # Health check для Render
+
     if IS_RENDER:
         asyncio.create_task(health_server())
-    
-    # Воркер очереди сканирования
     asyncio.create_task(queue_worker())
     
+    # При первом запуске — поиск каналов
+    total_q = conn.execute("SELECT COUNT(*) FROM scrape_queue").fetchone()[0]
+    if total_q == 0:
+        log.info("🔍 Очередь пуста — запускаю поиск каналов...")
+        asyncio.create_task(discover_channels())
+
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
