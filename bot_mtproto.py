@@ -222,7 +222,7 @@ async def cmd_start(event):
             "/queue — очередь каналов\n"
             "/search &lt;слова&gt; — поиск\n"
             "/export — скачать всё\n"
-            "/set_output — назначить этот чат для вывода\n"
+            "/set_output [@канал] — назначить канал вывода\n"
             "/pause — пауза\n"
             "/resume — продолжить")
     except Exception as e:
@@ -323,12 +323,31 @@ async def cmd_export(event):
 async def cmd_set_output(event):
     try:
         if not is_owner(event): return
-        chat = await event.get_chat()
-        chat_id = event.chat_id
-        title = getattr(chat, "title", None) or getattr(chat, "username", None) or "этот чат"
-        set_output_chat(chat_id)
-        await safe_send(event.chat_id,
-            f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
+        raw = event.pattern_match.group(1) if event.pattern_match else None
+        if raw and raw.strip():
+            # /set_output @channel_username
+            target = raw.strip().lower()
+            target = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', target).split('/')[0]
+            try:
+                entity = await client.get_entity(target)
+                chat_id = entity.id
+                title = getattr(entity, "title", None) or getattr(entity, "username", None) or target
+                set_output_chat(chat_id)
+                await safe_send(event.chat_id,
+                    f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
+            except Exception as e:
+                await safe_send(event.chat_id, f"❌ Не могу найти канал: {str(e)[:200]}")
+        else:
+            # /set_output — текущий чат (только ЛС)
+            if not event.is_private:
+                await safe_send(event.chat_id, "❌ В канале не сработает. Напиши /set_output @username_канала в ЛС.")
+                return
+            chat = await event.get_chat()
+            chat_id = event.chat_id
+            title = getattr(chat, "title", None) or getattr(chat, "username", None) or "этот чат"
+            set_output_chat(chat_id)
+            await safe_send(event.chat_id,
+                f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
     except Exception as e:
         log.exception("cmd_set_output: %s", e)
 
@@ -364,7 +383,7 @@ def register_handlers():
     client.add_event_handler(cmd_stats, events.NewMessage(pattern=r"^/stats$"))
     client.add_event_handler(cmd_search, events.NewMessage(pattern=r"^/search (.+)"))
     client.add_event_handler(cmd_export, events.NewMessage(pattern=r"^/export$"))
-    client.add_event_handler(cmd_set_output, events.NewMessage(pattern=r"^/set_output$"))
+    client.add_event_handler(cmd_set_output, events.NewMessage(pattern=r"^/set_output(?:\s+(.+))?$"))
     client.add_event_handler(cmd_pause, events.NewMessage(pattern=r"^/pause$"))
     client.add_event_handler(cmd_resume, events.NewMessage(pattern=r"^/resume$"))
 
