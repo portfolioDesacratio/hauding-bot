@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: text-collector
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: RENDER_URL
+        value: https://text-collector.onrender.com
+    disk:
+      name: collector-data
+      mountPath: /app/data
+      sizeGB: 1

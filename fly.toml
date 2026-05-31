@@ -1,0 +1,18 @@
+# fly.toml
+# 1. flyctl launch --from Dockerfile
+# 2. flyctl secrets set BOT_TOKEN=...
+# 3. flyctl volumes create collector_data --size 1
+# 4. flyctl deploy
+
+app = "text-collector"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATA_DIR = "/app/data"
+
+[mounts]
+  source = "collector_data"
+  destination = "/app/data"
