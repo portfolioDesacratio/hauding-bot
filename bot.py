@@ -63,12 +63,19 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     return True
 
 async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message: return
-    msg = update.message; chat = msg.chat
+    # Работает и для лички (update.message), и для каналов (update.channel_post)
+    msg = update.effective_message or update.channel_post
+    if not msg: return
+    chat = msg.chat
     title = chat.title or chat.username or chat.first_name or "?"
+    is_channel = chat.type in ("channel", "supergroup")
+    if is_channel:
+        log.info("📢 Канал %s: сообщение #%d (%d слов)", title, msg.message_id, wc(msg.text or ""))
+
     if msg.text and wc(msg.text) >= MIN_WORDS:
         link = f"https://t.me/{chat.username}/{msg.message_id}" if chat.username else None
         save_text(msg.text, title, str(chat.id), msg.message_id, link)
+
     if msg.text:
         for link in re.findall(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_+\-]{3,})', msg.text):
             if link.lower() in ("bot","botfather","telegram","gif","sticker","premium"): continue
@@ -83,9 +90,12 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             if link.startswith("+"):
                 with open(PRIVATE_FILE, "a") as f: f.write(f"t.me/{link} | из {title} | {datetime.now()}\n")
-                await msg.reply_text(f"🔒 Приватная: <code>t.me/{link}</code>\nДобавь бота вручную.", parse_mode="HTML")
+                # Не отвечаем в канал — только логируем
+                if not is_channel:
+                    await msg.reply_text(f"🔒 Приватная: <code>t.me/{link}</code>\nДобавь бота вручную.", parse_mode="HTML")
             else:
-                await msg.reply_text(f"📡 <b>{esc(t)}</b> (@{link}) запомнил.", parse_mode="HTML")
+                if not is_channel:
+                    await msg.reply_text(f"📡 <b>{esc(t)}</b> (@{link}) запомнил.", parse_mode="HTML")
     if msg.document:
         try:
             fn = msg.document.file_name or "unknown.txt"
@@ -95,7 +105,8 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 for b in re.split(r'\n\s*\n', data.decode("utf-8", errors="replace")):
                     if wc(b) >= MIN_WORDS:
                         save_text(b.strip(), title, str(chat.id), msg.message_id, f"file:{fn}")
-                await msg.reply_text(f"✅ {fn} обработан.", parse_mode="HTML")
+                if not is_channel:
+                    await msg.reply_text(f"✅ {fn} обработан.", parse_mode="HTML")
         except Exception as e: log.error("Файл: %s", e)
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -172,10 +183,7 @@ async def post_init(app: Application):
     me = await app.bot.get_me()
     log.info("🤖 Бот @%s запущен", me.username or "?")
     log.info("📁 База: %s", DB_PATH)
-    if IS_RENDER and WEBHOOK_URL:
-        await app.bot.set_webhook(WEBHOOK_URL)
-        log.info("🌐 Вебхук: %s", WEBHOOK_URL)
-    else:
+    if not IS_RENDER:
         log.info("🔄 Режим: polling")
     await app.bot.set_my_commands([
         BotCommand("start","Привет"), BotCommand("stats","Статистика"),
@@ -195,8 +203,8 @@ app.add_handler(MessageHandler(filters.Document.ALL, handle_msg))
 
 if __name__ == "__main__":
     if IS_RENDER:
-        log.info("Webhook на порту %d", PORT)
-        app.run_webhook(listen="0.0.0.0", port=PORT)
+        log.info("🌐 Вебхук: %s", WEBHOOK_URL)
+        app.run_webhook(listen="0.0.0.0", port=PORT, webhook_url=WEBHOOK_URL)
     else:
         log.info("Polling...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
