@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """TEAM SPIRIT — Telegram Collector (MTProto/Telethon)
-   Читает публичные каналы без вступления. Для Fly.io/Render."""
+   Читает публичные каналы без вступления. Работает на Render.com."""
 import asyncio, logging, os, re, sqlite3, sys
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +25,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not all([API_ID, API_HASH, BOT_TOKEN]):
     log.error("Задай API_ID, API_HASH, BOT_TOKEN в .env"); sys.exit(1)
 
+# Render auto‑detection
+IS_RENDER = os.getenv("RENDER") == "true"
+RENDER_URL = os.getenv("RENDER_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
+RENDER_URL = RENDER_URL.rstrip("/")
+PORT = int(os.getenv("PORT", 8080))
+
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "collector.db"
@@ -47,6 +53,7 @@ conn.execute("""CREATE TABLE IF NOT EXISTS scrape_queue (
 conn.commit()
 
 def wc(text): return len(text.split())
+
 def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     content = content.strip()
     if not content or wc(content) < MIN_WORDS: return False
@@ -63,50 +70,105 @@ client = TelegramClient("mt_session", API_ID, API_HASH).start(bot_token=BOT_TOKE
 RE_LINK = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_+\-]{3,})')
 _scanning = True
 
+# ─── Health‑check HTTP server (чтобы Render не уснул) ─────────────────
+async def health_server():
+    """Minimal HTTP server – Render health checks keep the service alive."""
+    async def handler(reader, writer):
+        request = b""
+        while b"\r\n\r\n" not in request:
+            chunk = await reader.read(1024)
+            if not chunk: break
+            request += chunk
+        # Respond 200 OK
+        response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
+        writer.write(response)
+        await writer.drain()
+        writer.close()
+    server = await asyncio.start_server(handler, "0.0.0.0", PORT)
+    log.info("🏥 Health check server on 0.0.0.0:%d", PORT)
+    async with server:
+        await server.serve_forever()
+
+# ─── Обработчик новых сообщений ──────────────────────────────────────
 @client.on(events.NewMessage)
 async def on_msg(event):
     global _scanning
     msg = event.message; chat = await event.get_chat()
     title = getattr(chat, "title", None) or getattr(chat, "username", None) or "?"
+    
+    # Сохраняем текст ≥50 слов
     if msg.text and wc(msg.text) >= MIN_WORDS:
         link = f"https://t.me/{chat.username}/{msg.id}" if getattr(chat,"username",None) else None
         save_text(msg.text, title, str(chat.id), msg.id, link)
+    
+    # Ищем ссылки на каналы
     if msg.text:
         for link in RE_LINK.findall(msg.text):
-            if link.lower() in ("bot","botfather","telegram","gif","sticker","premium"): continue
+            link_lower = link.lower()
+            if link_lower in ("bot","botfather","telegram","gif","sticker","premium"): continue
             if conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (link,)).fetchone(): continue
+            
             if link.startswith("+"):
-                with open(PRIVATE_FILE, "a") as f: f.write(f"t.me/{link} | из {title} | {datetime.now()}\n")
-                await safe_send(chat.id, f"🔒 Приватная: <code>t.me/{link}</code>\nДобавь бота вручную.")
+                # Приватный канал — пытаемся зайти
+                log.info("🔑 Пытаюсь зайти в %s из %s", link, title)
+                try:
+                    await client.join_chat(link)
+                    log.info("✅ Зашёл в %s!", link)
+                    conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)",
+                                 (link, f"private:{link}"))
+                    conn.commit()
+                    await safe_send(chat.id, f"🔓 Зашёл в <code>t.me/{link}</code>")
+                except Exception as e:
+                    log.warning("❌ Не зашёл в %s: %s", link, e)
+                    with open(PRIVATE_FILE, "a") as f:
+                        f.write(f"t.me/{link} | из {title} | {datetime.now()}\n")
                 continue
+            
+            # Публичный канал — добавляем в очередь
             try:
                 entity = await client.get_entity(link)
                 if not hasattr(entity, "title"): continue
                 t = getattr(entity, "title", None) or link
                 conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (link, t))
                 conn.commit()
-                log.info("➕ @%s (%s) в очередь", link, t)
+                log.info("➕ @%s (%s) в очередь на сканирование", link, t)
                 await safe_send(chat.id, f"📡 <b>{t}</b> (@{link}) в очереди на сканирование.")
-            except: pass
+            except errors.UsernameNotOccupiedError:
+                pass
+            except errors.FloodWaitError as e:
+                log.warning("FloodWait при get_entity: %dс", e.seconds)
+                await asyncio.sleep(e.seconds)
+            except Exception as e:
+                log.debug("Не удалось получить @%s: %s", link, e)
+    
+    # Файлы .txt
     if msg.document:
         try:
             fn = msg.file.name or "unknown.txt"
             if fn.endswith(".txt") or "text/plain" in (msg.file.mime_type or ""):
                 fb = await msg.download_media(bytes=True) or await client.download_file(msg.document, bytes=True)
                 for b in re.split(r'\n\s*\n', fb.decode("utf-8", errors="replace")):
-                    if wc(b) >= MIN_WORDS: save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}")
+                    if wc(b) >= MIN_WORDS:
+                        save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}")
                 await safe_send(chat.id, f"✅ {fn} обработан.")
-        except: pass
+        except Exception as e:
+            log.error("Файл: %s", e)
 
+# ─── Команды ─────────────────────────────────────────────────────────
 @client.on(events.NewMessage(pattern=r"^/start$"))
 async def cmd_start(event):
     await safe_send(event.chat_id,
-        "👋 <b>TEAM SPIRIT MTProto</b>\n\n"
-        "Читаю публичные каналы без вступления. Собираю тексты ≥50 слов.\n\n"
-        "Команды:\n/stats — статистика\n/queue — очередь каналов\n"
-        "/search <слова> — поиск\n/export — скачать всё\n"
-        "/pause — пауза\n/resume — продолжить\n\n"
-        "Кидай ссылки t.me/канал — сам зайду и выкачаю всё.")
+        "👋 <b>TEAM SPIRIT Collector (MTProto)</b>\n\n"
+        "Читаю публичные каналы без вступления.\n"
+        "Ищу ссылки в сообщениях, сканирую историю.\n"
+        "Пытаюсь зайти в закрытые чаты.\n\n"
+        "Команды:\n"
+        "/stats — статистика\n"
+        "/queue — очередь каналов\n"
+        "/search <слова> — поиск\n"
+        "/export — скачать всё\n"
+        "/pause — пауза\n"
+        "/resume — продолжить")
 
 @client.on(events.NewMessage(pattern=r"^/stats$"))
 async def cmd_stats(event):
@@ -115,15 +177,18 @@ async def cmd_stats(event):
     today = conn.execute("SELECT COUNT(*) FROM texts WHERE collected_at>=datetime('now','-1 day')").fetchone()[0]
     qd = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='done'").fetchone()[0]
     qp = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0]
+    qa = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='active'").fetchone()[0]
     await safe_send(event.chat_id,
-        f"📊 <b>Статистика</b>\n\nТекстов: <b>{total}</b>\nСлов: <b>{words:,}</b>\n"
-        f"За 24ч: <b>{today}</b>\n\nКаналы: ✅ {qd} готово, ⏳ {qp} в очереди")
+        f"📊 <b>Статистика</b>\n\n"
+        f"Текстов: <b>{total}</b>\nСлов: <b>{words:,}</b>\n"
+        f"За 24ч: <b>{today}</b>\n\n"
+        f"Каналы: ✅ {qd} готово, 🔄 {qa} active, ⏳ {qp} в очереди")
 
 @client.on(events.NewMessage(pattern=r"^/queue$"))
 async def cmd_queue(event):
-    rows = conn.execute("SELECT username,title,status,total_saved FROM scrape_queue ORDER BY added_at DESC LIMIT 20").fetchall()
+    rows = conn.execute("SELECT username,title,status,total_saved FROM scrape_queue ORDER BY added_at DESC LIMIT 30").fetchall()
     if not rows: await safe_send(event.chat_id, "📭 Пусто."); return
-    lines = ["📋 <b>Очередь:</b>\n"]
+    lines = ["📋 <b>Очередь (последние 30):</b>\n"]
     emoji = {"done":"✅","pending":"⏳","active":"🔄","error":"❌"}
     for u,t,s,sv in rows:
         lines.append(f"{emoji.get(s,'❓')} @{u} — {t or u}" + (f" ({sv})" if sv else ""))
@@ -155,25 +220,11 @@ async def cmd_resume(event):
     global _scanning; _scanning = True
     await safe_send(event.chat_id, "▶️ Продолжаем.")
 
-@client.on(events.NewMessage(pattern=r"^/help$"))
-async def cmd_help(event):
-    await safe_send(event.chat_id,
-        "📖 <b>Справка</b>\n\n"
-        "1. Добавь бота в канал/группу админом — читает всё\n"
-        "2. Кидай ссылки t.me/канал — бот сканирует всю историю\n"
-        "3. Публичные каналы читает <b>без вступления</b>\n"
-        "4. Приватные (t.me/+...) — добавь бота вручную\n"
-        "5. .txt файлы — разбирает\n"
-        "6. Сохраняет прогресс — перезапуск не страшен\n\n"
-        "Команды:\n"
-        "/stats — статистика\n/queue — очередь\n/search слова — поиск\n"
-        "/export — скачать всё\n/pause — пауза\n/resume — продолжить\n"
-        "/help — справка")
-
 async def safe_send(chat_id, text, parse_mode="html"):
     try: await client.send_message(chat_id, text, parse_mode=parse_mode)
     except Exception as e: log.warning("Не отправилось: %s", e)
 
+# ─── Сканирование истории канала ─────────────────────────────────────
 async def scrape_channel(username, resume_from=0):
     try: entity = await client.get_entity(username)
     except errors.UsernameNotOccupiedError: return -1
@@ -220,14 +271,25 @@ async def queue_worker():
             else: await asyncio.sleep(10)
         except Exception as e: log.error("Очередь: %s", e); await asyncio.sleep(30)
 
+# ─── Главный запуск ──────────────────────────────────────────────────
 async def main():
     me = await client.get_me()
     log.info("=" * 50)
     log.info("🤖 @%s (MTProto) запущен", me.username or "?")
     log.info("📁 База: %s", DB_PATH)
-    log.info("🌐 Режим: чтение каналов без входа + активные чаты")
+    if IS_RENDER:
+        log.info("🌐 Render: %s | Health check на порту %d", RENDER_URL or "?", PORT)
+    else:
+        log.info("🖥 Локальный режим (без health check)")
     log.info("=" * 50)
+    
+    # Health check для Render
+    if IS_RENDER:
+        asyncio.create_task(health_server())
+    
+    # Воркер очереди сканирования
     asyncio.create_task(queue_worker())
+    
     await client.run_until_disconnected()
 
 if __name__ == "__main__":

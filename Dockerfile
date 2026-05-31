@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
+COPY *.py .
 
 # Для данных
 VOLUME ["/app/data"]
@@ -14,4 +14,4 @@ VOLUME ["/app/data"]
 ENV HOST=0.0.0.0
 EXPOSE 8080
 
-CMD ["python", "bot.py"]
+CMD ["python", "bot_mtproto.py"]
