@@ -531,14 +531,34 @@ def register_handlers():
     log.info("✅ Зарегистрировано хендлеров: %d", eb_count)
 
 # ─── Сканирование истории канала ─────────────────────────────────────
+# Использует user-клиент (твой аккаунт) для чтения, бот-клиент только для управления
+async def get_reader():
+    """Возвращает клиент для чтения каналов: user_client если доступен, иначе bot_client"""
+    uc = get_user_client()
+    try:
+        if await uc.is_user_authorized():
+            if not uc.is_connected():
+                await uc.connect()
+            return uc, "user"
+    except:
+        pass
+    # fallback на бота (но он не может читать каналы)
+    return client, "bot"
+
 async def scrape_channel(username, resume_from=0, retries=0):
     if retries > 5:
         conn.execute("UPDATE scrape_queue SET status='error',error='Too many retries' WHERE username=?", (username,))
         conn.commit()
         log.error("❌ @%s: слишком много retries", username)
         return -1
+    reader, reader_type = await get_reader()
+    if reader_type == "bot":
+        conn.execute("UPDATE scrape_queue SET status='error',error='Bot cannot read channels, need /auth' WHERE username=?", (username,))
+        conn.commit()
+        log.warning("⚠️ @%s: нет user-клиента, бот не может читать", username)
+        return -1
     try:
-        entity = await client.get_entity(username)
+        entity = await reader.get_entity(username)
     except errors.UsernameNotOccupiedError:
         conn.execute("UPDATE scrape_queue SET status='error',error='Username not found' WHERE username=?", (username,))
         conn.commit()
@@ -548,11 +568,6 @@ async def scrape_channel(username, resume_from=0, retries=0):
         log.warning("FloodWait @%s: %dс (попытка %d/5)", username, e.seconds, retries + 1)
         await asyncio.sleep(min(e.seconds, 30))
         return await scrape_channel(username, resume_from, retries + 1)
-    except errors.BotMethodInvalidError as e:
-        conn.execute("UPDATE scrape_queue SET status='error',error='Bot not allowed' WHERE username=?", (username,))
-        conn.commit()
-        log.warning("⚠️ @%s: бот не может получить entity", username)
-        return -1
     except Exception as e:
         conn.execute("UPDATE scrape_queue SET status='error',error=? WHERE username=?", (str(e)[:500], username))
         conn.commit()
@@ -560,7 +575,7 @@ async def scrape_channel(username, resume_from=0, retries=0):
         return -1
     title = getattr(entity, "title", None) or username
     saved = processed = 0; last_id = resume_from
-    log.info("📡 @%s с msg#%d...", username, resume_from)
+    log.info("📡 [%s] @%s с msg#%d...", reader_type, username, resume_from)
     exists = conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone()
     if exists:
         conn.execute("UPDATE scrape_queue SET status='active',last_msg_id=? WHERE username=?", (resume_from, username))
@@ -568,7 +583,7 @@ async def scrape_channel(username, resume_from=0, retries=0):
         conn.execute("INSERT INTO scrape_queue (username,title,status,last_msg_id) VALUES (?,?,'active',?)", (username, title, resume_from))
     conn.commit()
     try:
-        async for msg in client.iter_messages(entity, min_id=resume_from, reverse=True, wait_time=2):
+        async for msg in reader.iter_messages(entity, min_id=resume_from, reverse=True, wait_time=2):
             processed += 1; last_id = msg.id
             if msg.text and wc(msg.text) >= MIN_WORDS:
                 link = f"https://t.me/{entity.username}/{msg.id}" if getattr(entity, "username", None) else None
@@ -578,29 +593,24 @@ async def scrape_channel(username, resume_from=0, retries=0):
             if processed % 500 == 0:
                 conn.execute("UPDATE scrape_queue SET last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                              (last_id, saved, username)); conn.commit()
-                log.info("  ⏳ @%s: %d обработано, %d сохранено", username, processed, saved)
+                log.info("  ⏳ [%s] @%s: %d обработано, %d сохранено", reader_type, username, processed, saved)
                 await asyncio.sleep(1)
     except errors.FloodWaitError as e:
         conn.execute("UPDATE scrape_queue SET status='pending',last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                      (last_id, saved, username)); conn.commit()
-        log.warning("FloodWait @%s: %dс (внутри)", username, e.seconds)
+        log.warning("FloodWait [%s] @%s: %dс (внутри)", reader_type, username, e.seconds)
         if retries > 3:
             log.error("❌ @%s: FloodWait слишком много раз, пропускаю", username)
             return saved
         await asyncio.sleep(min(e.seconds, 120))
         return await scrape_channel(username, last_id, retries + 1)
-    except errors.BotMethodInvalidError as e:
-        conn.execute("UPDATE scrape_queue SET status='error',error='Bot not allowed to read this channel' WHERE username=?", (username,))
-        conn.commit()
-        log.warning("⚠️ @%s: бот не может читать этот канал", username)
-        return saved
     except Exception as e:
         conn.execute("UPDATE scrape_queue SET status='error',error=?,last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                      (str(e)[:500], last_id, saved, username)); conn.commit()
-        log.error("❌ @%s: %s", username, e); return saved
+        log.error("❌ [%s] @%s: %s", reader_type, username, e); return saved
     conn.execute("UPDATE scrape_queue SET status='done',last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                  (last_id, saved, username)); conn.commit()
-    log.info("✅ @%s: %d сообщений, %d сохранено", username, processed, saved)
+    log.info("✅ [%s] @%s: %d сообщений, %d сохранено", reader_type, username, processed, saved)
     return saved
 
 async def queue_worker():
