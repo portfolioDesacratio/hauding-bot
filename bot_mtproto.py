@@ -79,11 +79,27 @@ def text_matches_keywords(text):
     text_lower = text.lower()
     for kw in keywords:
         if kw in text_lower:
-            return True
+            # Проверяем, что это не часть заблокированной фразы
+            blocked = False
+            for bp in _keyword_blocked:
+                if bp in text_lower:
+                    blocked = True
+                    break
+            if not blocked:
+                return True
     return False
 
+# Фразы, которые содержат ключевые слова, но НЕ должны триггерить совпадение
+_keyword_blocked = [
+    "мумий тролль",      # группа, магазин, музыка
+    "mumiytroll",        # сайт магазина
+    "mumiy troll",       # латиницей
+    "тролль music bar",  # бар
+    "хауди микоски",     # howdie mickoski — эзотерика/саморазвитие
+]
+
 # Каналы, которые НЕ надо обрабатывать
-EXCLUDED_CHANNELS = {"desacratio", "thesaurus"}
+EXCLUDED_CHANNELS = {"desacratio", "thesaurus", "vldvstk3000", "mtbarmoscow", "howdie_mickoski"}
 
 def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     content = content.strip()
