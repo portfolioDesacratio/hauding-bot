@@ -137,6 +137,8 @@ def _build_backup_text():
     if kw: lines.append(f"searchwords={kw[0]}")
     if phone: lines.append(f"phone={phone[0]}")
     if auto: lines.append(f"autosearch={auto[0]}")
+    pers = get_persistent_channels()
+    if pers: lines.append(f"persistent={','.join(pers)}")
     return "\n".join(lines)
 
 def _parse_backup_lines(text):
@@ -164,6 +166,11 @@ def _parse_backup_lines(text):
             if val:
                 conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", val))
                 log.info("📦 Восстановлен автопоиск: %s", val)
+        elif line.startswith("persistent="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("persistent_channels", val))
+                log.info("📦 Восстановлены persistent-каналы: %s", val)
     conn.commit()
     return True
 
@@ -270,6 +277,48 @@ async def restore_settings_from_backup():
     
     log.info("📦 Бэкап не найден")
     return False
+
+# ─── Persistent‑каналы (выживают при редеплое) ─────────────────────
+def get_persistent_channels():
+    """Возвращает список username каналов, которые должны быть в очереди всегда"""
+    row = conn.execute("SELECT value FROM config WHERE key='persistent_channels'").fetchone()
+    if not row or not row[0].strip(): return []
+    return [ch.strip().lower() for ch in row[0].split(",") if ch.strip()]
+
+def add_persistent_channel(username):
+    username = username.lower().strip().lstrip("@")
+    cur = get_persistent_channels()
+    if username in cur: return False
+    cur.append(username)
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("persistent_channels", ",".join(cur)))
+    conn.commit()
+    asyncio.create_task(backup_settings_to_telegram())
+    return True
+
+def remove_persistent_channel(username):
+    username = username.lower().strip().lstrip("@")
+    cur = get_persistent_channels()
+    if username not in cur: return False
+    cur.remove(username)
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                 ("persistent_channels", ",".join(cur) if cur else ""))
+    conn.commit()
+    asyncio.create_task(backup_settings_to_telegram())
+    return True
+
+async def add_persistent_to_queue():
+    """Добавляет все persistent-каналы в очередь (если их там нет)"""
+    added = 0
+    for ch in get_persistent_channels():
+        try:
+            conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (ch, ch))
+            added += 1
+        except Exception as e:
+            log.warning("⚠️ persistent @%s: %s", ch, e)
+    if added:
+        conn.commit()
+        log.info("📌 Добавлено %d persistent-каналов в очередь", added)
+
 async def health_server():
     async def handler(reader, writer):
         try:
@@ -309,12 +358,17 @@ async def self_pinger():
 _last_send_time = 0.0
 _send_lock = asyncio.Lock()
 
-async def send_to_output(text, source_title, source_link=None):
+async def send_to_output(text, source_title=None, source_link=None):
     global _last_send_time
     out = get_output_chat()
     if not out: return
 
-    # Rate limit: не чаще 1 сообщения в 3 секунды
+    text_clean = text.replace("<", "&lt;").replace(">", "&gt;")
+    message = text_clean
+    if len(message) > 3950:
+        message = message[:3950] + "\n\n✂️ ..."
+
+    # Rate limit + отправка под одним lock — предотвращает FloodWait
     async with _send_lock:
         now = asyncio.get_event_loop().time()
         since_last = now - _last_send_time
@@ -322,20 +376,15 @@ async def send_to_output(text, source_title, source_link=None):
             wait = 3.0 - since_last
             log.debug("⏳ Rate limit send: жду %.1fс", wait)
             await asyncio.sleep(wait)
-        _last_send_time = asyncio.get_event_loop().time()
-
-    text_clean = text.replace("<", "&lt;").replace(">", "&gt;")
-    message = text_clean
-    if len(message) > 3950:
-        message = message[:3950] + "\n\n✂️ ..."
-    try:
-        await client.send_message(out, message, parse_mode="html")
-        log.info("📤 Отправлено в канал вывода")
-    except errors.FloodWaitError as e:
-        log.warning("⏳ FloodWait при отправке: %dс", e.seconds)
-        await asyncio.sleep(min(e.seconds, 10))
-    except Exception as e:
-        log.warning("Не отправилось в канал: %s", e)
+        try:
+            await client.send_message(out, message, parse_mode="html")
+            _last_send_time = asyncio.get_event_loop().time()
+            log.info("📤 Отправлено в канал вывода")
+        except errors.FloodWaitError as e:
+            log.warning("⏳ FloodWait при отправке: %dс", e.seconds)
+            await asyncio.sleep(min(e.seconds, 10))
+        except Exception as e:
+            log.warning("Не отправилось в канал: %s", e)
 
 # ─── Проверка владельца ──────────────────────────────────────────────
 def is_owner(event):
@@ -453,6 +502,8 @@ async def cmd_start(event):
             "/stats — статистика\n"
             "/add &lt;username&gt; — добавить канал (или /add +invite для приватных)\n"
             "/remove &lt;username&gt; — удалить канал\n"
+            "/persist &lt;username&gt; — добавить в persistent (не пропадёт при редеплое)\n"
+            "/unpersist &lt;username&gt; — убрать из persistent\n"
             "/queue — очередь каналов\n"
             "/search &lt;слова&gt; — поиск\n"
             "/export — скачать всё\n"
@@ -585,6 +636,30 @@ async def cmd_remove(event):
         await safe_send(event.chat_id, f"🗑 @{username} удалён из очереди.")
     else:
         await safe_send(event.chat_id, f"❌ @{username} нет в очереди.")
+
+async def cmd_persist(event):
+    """Добавить канал в persistent (выживает при редеплое)"""
+    if not is_owner(event): return
+    raw = event.pattern_match.group(1).strip().lower()
+    username = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', raw).split('/')[0].split('?')[0]
+    # Добавляем в очередь если ещё нет
+    if not conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone():
+        conn.execute("INSERT INTO scrape_queue (username,title) VALUES (?,?)", (username, username))
+        conn.commit()
+    if add_persistent_channel(username):
+        await safe_send(event.chat_id, f"📌 @{username} добавлен в persistent. Не пропадёт при редеплое.")
+    else:
+        await safe_send(event.chat_id, f"ℹ️ @{username} уже в persistent.")
+
+async def cmd_unpersist(event):
+    """Убрать канал из persistent"""
+    if not is_owner(event): return
+    raw = event.pattern_match.group(1).strip().lower()
+    username = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', raw).split('/')[0].split('?')[0]
+    if remove_persistent_channel(username):
+        await safe_send(event.chat_id, f"🗑 @{username} убран из persistent.")
+    else:
+        await safe_send(event.chat_id, f"❌ @{username} не в persistent.")
 
 async def cmd_search(event):
     try:
@@ -834,6 +909,8 @@ def register_handlers():
     client.add_event_handler(cmd_data_dir, events.NewMessage(pattern=r"^/data_dir$"))
     client.add_event_handler(cmd_reseed, events.NewMessage(pattern=r"^/reseed$"))
     client.add_event_handler(cmd_remove, events.NewMessage(pattern=r"^/remove\s+(.+)"))
+    client.add_event_handler(cmd_persist, events.NewMessage(pattern=r"^/persist\s+(.+)"))
+    client.add_event_handler(cmd_unpersist, events.NewMessage(pattern=r"^/unpersist\s+(.+)"))
 
     # User client команды
     client.add_event_handler(cmd_auth, events.NewMessage(pattern=r"^/auth$"))
@@ -1565,6 +1642,8 @@ async def main():
     if kw: restored_settings.append(f"🔍 Ключевые слова: {kw[0][:60]}...")
     auto = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
     if auto: restored_settings.append(f"🔄 Автопоиск: {auto[0]}")
+    pers = get_persistent_channels()
+    if pers: restored_settings.append(f"📌 Persistent: {len(pers)} каналов")
     texts_count = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
     restored_settings.append(f"📚 Текстов в базе: {texts_count}")
     startup_msg = "🔄 <b>Бот перезапущен</b>\n" + "\n".join(f"• {s}" for s in restored_settings)
@@ -1581,6 +1660,8 @@ async def main():
     total_q = conn.execute("SELECT COUNT(*) FROM scrape_queue").fetchone()[0]
     if total_q == 0:
         asyncio.create_task(add_seed_channels())
+    # Persistent-каналы добавляем в любом случае (они могли не успеть добавиться при seed)
+    asyncio.create_task(add_persistent_to_queue())
 
     await client.run_until_disconnected()
 
