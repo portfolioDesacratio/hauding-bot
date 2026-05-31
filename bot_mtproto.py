@@ -245,7 +245,8 @@ async def cmd_start(event):
             "/pause — пауза\n"
             "/resume — продолжить\n"
             "/debug — диагностика\n"
-            "/data_dir — путь к данным\n\n"
+            "/data_dir — путь к данным\n"
+            "/reseed — сбросить очередь (только троллинг)\n\n"
             "🔍 Поиск каналов (user-клиент):\n"
             "/auth — авторизовать user-клиент\n"
             "/phone +7... — номер телефона\n"
@@ -523,6 +524,16 @@ async def cmd_data_dir(event):
         f"Сессия user: {session_file} {'✅' if session_exists else '❌'}\n"
         f"Render: {'✅' if IS_RENDER else '❌'}")
 
+async def cmd_reseed(event):
+    """Очистить очередь и добавить seed каналы заново"""
+    if not is_owner(event): return
+    conn.execute("DELETE FROM scrape_queue")
+    conn.commit()
+    msg = await safe_send(event.chat_id, "🔄 Очередь очищена, добавляю seed каналы...")
+    await add_seed_channels()
+    total = conn.execute("SELECT COUNT(*) FROM scrape_queue").fetchone()[0]
+    await safe_send(event.chat_id, f"✅ Добавлено {total} seed-каналов. Начинаю сбор.")
+
 # ─── Регистрация всех хендлеров ПОСЛЕ старта клиента ──────────────
 def register_handlers():
     """Добавляем обработчики событий через add_event_handler (не декораторы)"""
@@ -547,6 +558,7 @@ def register_handlers():
     client.add_event_handler(cmd_resume, events.NewMessage(pattern=r"^/resume$"))
     client.add_event_handler(cmd_debug, events.NewMessage(pattern=r"^/debug$"))
     client.add_event_handler(cmd_data_dir, events.NewMessage(pattern=r"^/data_dir$"))
+    client.add_event_handler(cmd_reseed, events.NewMessage(pattern=r"^/reseed$"))
 
     # User client команды
     client.add_event_handler(cmd_auth, events.NewMessage(pattern=r"^/auth$"))
@@ -718,51 +730,60 @@ async def queue_worker():
 
 # ─── Seed-каналы для первого запуска ─────────────────────────────────
 async def add_seed_channels():
-    log.info("📡 Добавляю начальные каналы...")
+    log.info("📡 Добавляю начальные каналы (троллинг/хаудинг)...")
     seed_channels = [
-        # --- Крупнейшие СМИ ---
-        "rian_ru", "tass_agency", "rt_russian", "rbc_news",
-        "meduzalive", "lentadnya", "varlamov",
-        "moscowmap", "izvestia", "kommersant", "vedomosti",
-        "fontanka", "novayagazeta", "theinsider",
-        "bbcrussian", "dw_russian", "svoboda_radio",
-        "nastoyaschee", "currenttime", "krymrealii",
-        "kavkaz_realii", "sibir_realii", "idelreal",
-        "golosameriki", "euronews_ru", "russian_rt",
-        "tvrain", "dozhd", "znak_com", "ura_ru",
-        "mk_ru", "kp_ru", "life_news", "lifenews_78",
-        "breakingmash", "mash", "mashnews",
-        "baza", "bazabazon", "readovkanews",
-        "ostorozhno_novosti", "projury", "sotaproject",
-        # --- Политика / аналитика ---
-        "navalny", "teamnavalny", "navalny_fb", "navalnyinfobot",
-        "fbk_info", "alexei_navalny", "navalnycom",
-        "nemtsov_fond", "khodorkovsky", "mbkmedia",
-        "novayagazeta_eu", "mediazona", "zona_media",
-        "ovdinfo", "pchikov", "svetov_m",
-        "egor_chemessi", "stanovaya", "faridaily",
-        "katz", "max_katz", "katz_eng",
-        "ponomarev", "belkovskiy", "shein_official",
-        # --- Экономика ---
-        "rbc_money", "banki_ru", "smartlab", "fincult",
-        "moscowexchange", "cbr_ru", "minfin_ru",
-        "elly_ru", "openfinance", "frank_media",
-        "inventure_ru", "proeconomics",
-        # --- Технологии ---
-        "roem_ru", "habr_com", "tproger", "dtf",
-        "iguides", "android_ru", "apple_news",
-        "techdays", "codernet", "itmozg",
-        # --- Коррупция / расследования ---
-        "meduzalive", "istories_media", "agentstvonews",
-        "dossier_center", "projectmedia", "bellingcat",
-        "insider_ru", "thebell_io", "yabloko_ru",
-        # --- Регионы ---
-        "krym_24", "crimea_news", "crimea_realii",
-        "kavkaz_knot", "kavkazr", "kuban_24",
-        "ural_news", "sibir_news", "dalnijvostok",
-        "spb_news", "spb_sobiratel", "fontanka_spb",
-        "msk_news", "moslenta", "mosgorsud",
-        "podmoskovie", "nso_news", "tatarstan",
+        # --- Троллинг / провокации / шаблоны ---
+        "shablidlyatrolinga",
+        "yabogtroll",
+        "trolling_shablony",
+        "shablonytrollinga",
+        "troll_hard",
+        "provokacii",
+        "provocator",
+        "trolling_channel",
+        "trollfactory",
+        "trolling_ru",
+        "trolling_rus",
+        "troll_rus",
+        "provokator",
+        "provokation",
+        # --- Хаудинг ---
+        "hauding",
+        "hauders",
+        "hauder",
+        "hauding_channel",
+        "hauding_info",
+        "hauding_rus",
+        # --- Вбросы / фейки ---
+        "vbros",
+        "feiki_net",
+        "fake_news",
+        "fakenews",
+        "fakty_i_fake",
+        # --- Компромат ---
+        "kompromat_group",
+        "kompromat_ru",
+        "kompromat_news",
+        "kompromat_xyz",
+        "compromat",
+        "kompromatt",
+        # --- Оккультизм / шаббат ---
+        "okkultizm",
+        "okkult",
+        "shabbat",
+        "okkult_ru",
+        "magiia",
+        # --- Прочие релевантные ---
+        "trolls_army",
+        "trolls_of_russia",
+        "trolling_army",
+        "provokator_ru",
+        "black_pr",
+        "blackpr",
+        "pr_black",
+        "trolling_world",
+        "trollworld",
+        "trolls_team",
     ]
     added = 0
     for ch in seed_channels:
