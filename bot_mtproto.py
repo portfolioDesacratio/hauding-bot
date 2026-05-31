@@ -150,18 +150,10 @@ async def on_msg(event):
                 if conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (link,)).fetchone(): continue
 
                 if link.startswith("+"):
-                    log.info("🔑 Пытаюсь зайти в %s из %s", link, title)
-                    try:
-                        # Telethon 1.37+: join_chat через вызов API
-                        await client(functions.messages.ImportChatInviteRequest(hash=link[1:]))
-                        log.info("✅ Зашёл в %s!", link)
-                        conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)",
-                                     (link, f"private:{link}"))
-                        conn.commit()
-                    except Exception as e:
-                        log.warning("❌ Не зашёл в %s: %s", link, e)
-                        with open(DATA_DIR / "private_links.txt", "a") as f:
-                            f.write(f"t.me/{link} | из {title} | {datetime.now()}\n")
+                    # Приватная ссылка — не заходим, просто логируем
+                    log.info("🔑 Приватная ссылка %s из %s (пропускаем)", link, title)
+                    with open(DATA_DIR / "private_links.txt", "a") as f:
+                        f.write(f"t.me/{link} | из {title} | {datetime.now()}\n")
                     continue
 
                 try:
@@ -214,8 +206,7 @@ async def cmd_start(event):
         await safe_send(event.chat_id,
             "👋 <b>Thesaurus Collector</b>\n\n"
             "Собираю тексты <b>≥50 слов</b> из публичных каналов.\n"
-            "Нахожу новые каналы через ссылки в сообщениях.\n"
-            "Пытаюсь зайти в закрытые чаты.\n\n"
+            "Нахожу новые каналы через ссылки в сообщениях.\n\n"
             "Команды:\n"
             "/stats — статистика\n"
             "/add &lt;username&gt; — добавить канал\n"
