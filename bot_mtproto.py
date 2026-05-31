@@ -583,18 +583,20 @@ async def scrape_channel(username, resume_from=0, retries=0):
         conn.execute("INSERT INTO scrape_queue (username,title,status,last_msg_id) VALUES (?,?,'active',?)", (username, title, resume_from))
     conn.commit()
     try:
-        async for msg in reader.iter_messages(entity, min_id=resume_from, reverse=True, wait_time=2):
+        async for msg in reader.iter_messages(entity, min_id=resume_from, reverse=True, wait_time=3):
             processed += 1; last_id = msg.id
             if msg.text and wc(msg.text) >= MIN_WORDS:
                 link = f"https://t.me/{entity.username}/{msg.id}" if getattr(entity, "username", None) else None
                 if save_text(msg.text, title, str(entity.id), msg.id, link):
                     await send_to_output(msg.text, title, link)
                 saved += 1
-            if processed % 500 == 0:
+            # Задержка между сообщениями — предотвращает FloodWait
+            await asyncio.sleep(1.5)
+            if processed % 200 == 0:
                 conn.execute("UPDATE scrape_queue SET last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                              (last_id, saved, username)); conn.commit()
                 log.info("  ⏳ [%s] @%s: %d обработано, %d сохранено", reader_type, username, processed, saved)
-                await asyncio.sleep(1)
+                await asyncio.sleep(3)
     except errors.FloodWaitError as e:
         conn.execute("UPDATE scrape_queue SET status='pending',last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                      (last_id, saved, username)); conn.commit()
@@ -640,7 +642,7 @@ async def queue_worker():
                     conn.commit()
                     result = -1
                 log.info("🚀 Queue: @%s завершён, результат=%s", row[0], result)
-                await asyncio.sleep(10)
+                await asyncio.sleep(15)
                 continue
 
             # Нет pending — циклично перепроверяем done-каналы (подхватываем новые сообщения)
@@ -650,9 +652,9 @@ async def queue_worker():
                 ch, last_id = all_done[_cycle_offset]
                 log.info("🔄 Перепроверяю @%s (новые после #%d)...", ch, last_id)
                 await scrape_channel(ch, last_id)
-                await asyncio.sleep(15)
+                await asyncio.sleep(20)
             else:
-                await asyncio.sleep(10)
+                await asyncio.sleep(15)
         except Exception as e:
             log.exception("Очередь: %s", e); await asyncio.sleep(30)
 
