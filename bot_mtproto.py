@@ -66,7 +66,7 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     log.info("💾 %d слов из %s", words, chat_title)
     return True
 
-client = TelegramClient("mt_session", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+client = TelegramClient("mt_session", API_ID, API_HASH)
 RE_LINK = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_+\-]{3,})')
 _scanning = True
 
@@ -273,6 +273,7 @@ async def queue_worker():
 
 # ─── Главный запуск ──────────────────────────────────────────────────
 async def main():
+    await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     log.info("=" * 50)
     log.info("🤖 @%s (MTProto) запущен", me.username or "?")
