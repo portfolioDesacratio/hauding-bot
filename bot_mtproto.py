@@ -616,10 +616,9 @@ async def scrape_channel(username, resume_from=0, retries=0):
     return saved
 
 async def queue_worker():
-    """Постоянно сканирует каналы: до MAX_CONCURRENT каналов одновременно"""
-    MAX_CONCURRENT = 3
+    """Постоянно сканирует ВСЕ каналы одновременно"""
     active_tasks = {}  # username -> task
-    log.info("🚀 Queue worker запущен (до %d параллельно)", MAX_CONCURRENT)
+    log.info("🚀 Queue worker запущен — обрабатываю все каналы сразу")
 
     async def run_scrape(username, last_msg_id):
         """Обёртка для scrape_channel с таймаутом"""
@@ -636,13 +635,13 @@ async def queue_worker():
             return -1
 
     while True:
-        # Пульс воркера каждые 5с
+        # Пульс воркера каждые 3с
         conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
                      ("qw_heartbeat", datetime.now().isoformat()))
         conn.commit()
 
         if not _scanning:
-            await asyncio.sleep(5); continue
+            await asyncio.sleep(3); continue
 
         # Убираем завершённые задачи
         finished = [u for u, t in list(active_tasks.items()) if t.done()]
@@ -655,31 +654,29 @@ async def queue_worker():
             del active_tasks[u]
 
         try:
-            # Запускаем новые pending-каналы, пока есть место
-            running = len(active_tasks)
-            if running < MAX_CONCURRENT:
-                rows = conn.execute(
-                    "SELECT username,last_msg_id FROM scrape_queue WHERE status='pending' ORDER BY added_at LIMIT ?",
-                    (MAX_CONCURRENT - running,)
+            # Запускаем ВСЕ pending-каналы, которых ещё нет в active_tasks
+            rows = conn.execute(
+                "SELECT username,last_msg_id FROM scrape_queue WHERE status='pending' ORDER BY added_at"
+            ).fetchall()
+            for row in rows:
+                if row[0] not in active_tasks:
+                    task = asyncio.create_task(run_scrape(row[0], row[1]))
+                    active_tasks[row[0]] = task
+                    log.info("🚀 Запущен @%s (всего активно: %d)", row[0], len(active_tasks))
+
+            # Если ничего не запущено — перепроверяем done-каналы (до 5 одновременно)
+            if not active_tasks:
+                done_rows = conn.execute(
+                    "SELECT username,last_msg_id FROM scrape_queue WHERE status='done' ORDER BY RANDOM() LIMIT 5"
                 ).fetchall()
-                for row in rows:
+                for row in done_rows:
                     if row[0] not in active_tasks:
                         task = asyncio.create_task(run_scrape(row[0], row[1]))
                         active_tasks[row[0]] = task
-                        log.info("🚀 Запущен @%s (активно %d/%d)", row[0], len(active_tasks), MAX_CONCURRENT)
-
-            # Если ничего не запущено — перепроверяем done-канал
-            if not active_tasks:
-                done_ch = conn.execute(
-                    "SELECT username,last_msg_id FROM scrape_queue WHERE status='done' ORDER BY RANDOM() LIMIT 1"
-                ).fetchone()
-                if done_ch:
-                    task = asyncio.create_task(run_scrape(done_ch[0], done_ch[1]))
-                    active_tasks[done_ch[0]] = task
-                    log.info("🔄 Перепроверка @%s", done_ch[0])
-                else:
-                    log.info("⏳ Нет каналов для обработки, жду...")
-                    await asyncio.sleep(30)
+                        log.info("🔄 Перепроверка @%s", row[0])
+                if not active_tasks:
+                    log.info("⏳ Нет каналов, жду...")
+                    await asyncio.sleep(15)
                     continue
 
             await asyncio.sleep(3)
