@@ -316,18 +316,57 @@ async def cmd_set_output(event):
         if not is_owner(event): return
         raw = event.pattern_match.group(1) if event.pattern_match else None
         if raw and raw.strip():
-            # /set_output @channel_username
-            target = raw.strip().lower()
-            target = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', target).split('/')[0]
+            target = raw.strip()
+            invite_code = None
+
+            # Это инвайт-ссылка? (t.me/+xxx)
+            m = re.search(r't\.me/\+([a-zA-Z0-9_\-]+)', target)
+            if m:
+                invite_code = m.group(1)
+            else:
+                # /set_output @username
+                target_clean = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', target).split('/')[0].split('?')[0]
+                if target_clean.startswith('+'):
+                    invite_code = target_clean[1:]
+                else:
+                    target_clean = target_clean
+
+            if invite_code:
+                # Приватный канал — заходим (нужно для отправки)
+                try:
+                    updates = await client(functions.messages.ImportChatInviteRequest(hash=invite_code))
+                    # Результат: chats = [chat]
+                    if hasattr(updates, 'chats') and updates.chats:
+                        chat = updates.chats[0]
+                        chat_id = chat.id
+                        title = getattr(chat, "title", None) or "канал"
+                    else:
+                        # Не смогли получить канал — пробуем найти через get_entity
+                        await asyncio.sleep(2)
+                        entity = await client.get_entity(f"+{invite_code}")
+                        chat_id = entity.id
+                        title = getattr(entity, "title", None) or "канал"
+                    set_output_chat(chat_id)
+                    await safe_send(event.chat_id,
+                        f"✅ Зашёл в <b>{title}</b> и назначил каналом вывода.\n"
+                        f"Теперь все тексты будут отправляться туда.")
+                except errors.FloodWaitError as e:
+                    await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
+                except Exception as e:
+                    await safe_send(event.chat_id, f"❌ Не могу зайти по ссылке: {str(e)[:200]}")
+                return
+
+            # Публичный канал по username
             try:
-                entity = await client.get_entity(target)
+                entity = await client.get_entity(target_clean)
                 chat_id = entity.id
-                title = getattr(entity, "title", None) or getattr(entity, "username", None) or target
-                set_output_chat(chat_id)
-                await safe_send(event.chat_id,
-                    f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
+                title = getattr(entity, "title", None) or getattr(entity, "username", None) or target_clean
             except Exception as e:
                 await safe_send(event.chat_id, f"❌ Не могу найти канал: {str(e)[:200]}")
+                return
+            set_output_chat(chat_id)
+            await safe_send(event.chat_id,
+                f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
         else:
             # /set_output — текущий чат (только ЛС)
             if not event.is_private:
