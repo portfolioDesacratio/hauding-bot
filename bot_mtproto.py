@@ -1021,7 +1021,18 @@ async def main():
     if IS_RENDER:
         asyncio.create_task(health_server())
 
-    await client.start(bot_token=BOT_TOKEN)
+    # Стартуем с retry при FloodWait (бывает после частых редеплоев)
+    for attempt in range(10):
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            break
+        except errors.FloodWaitError as e:
+            wait = min(e.seconds, 300)
+            log.warning("⏳ FloodWait при входе: %dс (попытка %d/10, жду %dс)", e.seconds, attempt + 1, wait)
+            await asyncio.sleep(wait)
+    else:
+        log.error("❌ Не удалось войти после 10 попыток")
+        return
     # Регистрируем хендлеры ПОСЛЕ старта
     register_handlers()
 
