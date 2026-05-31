@@ -124,102 +124,151 @@ _scanning = True
 
 # ─── Бэкап настроек в Telegram (чтобы не слетало после редеплоя) ──
 BACKUP_MSG_ID_KEY = "backup_msg_id"
+FALLBACK_OUTPUT_CHAT = -1003956215779  # канал вывода (постоянный, бот там админ)
+
+def _build_backup_text():
+    """Собирает текст бэкапа из текущих настроек в БД"""
+    out = get_output_chat()
+    kw = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
+    phone = conn.execute("SELECT value FROM config WHERE key='user_phone'").fetchone()
+    auto = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
+    lines = ["📦 Бэкап настроек Thesaurus"]
+    if out: lines.append(f"output_chat={out}")
+    if kw: lines.append(f"searchwords={kw[0]}")
+    if phone: lines.append(f"phone={phone[0]}")
+    if auto: lines.append(f"autosearch={auto[0]}")
+    return "\n".join(lines)
+
+def _parse_backup_lines(text):
+    """Парсит строки бэкапа и восстанавливает настройки в БД"""
+    if not text or not text.startswith("📦 Бэкап настроек Thesaurus"):
+        return False
+    for line in text.split("\n"):
+        if line.startswith("output_chat="):
+            val = line.split("=", 1)[1].strip()
+            if val and val != "None":
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("output_chat", val))
+                log.info("📦 Восстановлен канал вывода: %s", val)
+        elif line.startswith("searchwords="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_search_keywords", val))
+                log.info("📦 Восстановлены ключевые слова")
+        elif line.startswith("phone="):
+            val = line.split("=", 1)[1].strip()
+            if val and val != "None":
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_phone", val))
+                log.info("📦 Восстановлен телефон: %s", val)
+        elif line.startswith("autosearch="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", val))
+                log.info("📦 Восстановлен автопоиск: %s", val)
+    conn.commit()
+    return True
+
+async def _save_backup_to_chat(chat_id, backup_text):
+    """Сохраняет/обновляет бэкап в указанном чате, возвращает msg_id"""
+    old_key = f"backup_msg_id_{chat_id}"
+    old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (old_key,)).fetchone()
+    if old_msg_id:
+        try:
+            await client.edit_message(chat_id, int(old_msg_id[0]), backup_text)
+            log.debug("💾 Бэкап обновлён в чате %s (msg_id=%s)", chat_id, old_msg_id[0])
+            return int(old_msg_id[0])
+        except Exception:
+            pass
+    msg = await client.send_message(chat_id, backup_text, parse_mode="html")
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (old_key, str(msg.id)))
+    conn.commit()
+    log.debug("💾 Бэкап создан в чате %s (msg_id=%s)", chat_id, msg.id)
+    return msg.id
 
 async def backup_settings_to_telegram():
-    """Сохраняет текущие настройки в сообщение владельцу"""
+    """Сохраняет настройки владельцу (для глаз) И в канал вывода (для восстановления)"""
     try:
-        out = get_output_chat()
-        kw = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
-        phone = conn.execute("SELECT value FROM config WHERE key='user_phone'").fetchone()
-        auto = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
-        lines = ["📦 Бэкап настроек Thesaurus"]
-        if out: lines.append(f"output_chat={out}")
-        if kw: lines.append(f"searchwords={kw[0]}")
-        if phone: lines.append(f"phone={phone[0]}")
-        if auto: lines.append(f"autosearch={auto[0]}")
-        backup_text = "\n".join(lines)
+        backup_text = _build_backup_text()
         
-        old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (BACKUP_MSG_ID_KEY,)).fetchone()
-        if old_msg_id:
-            try:
-                await client.edit_message(OWNER_ID, int(old_msg_id[0]), backup_text)
-                log.info("💾 Бэкап обновлён (msg_id=%s)", old_msg_id[0])
-                return
-            except:
-                pass
-        # Если не получилось отредактировать — шлём новое
-        msg = await client.send_message(OWNER_ID, backup_text, parse_mode="html")
-        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
-        conn.commit()
-        log.info("💾 Бэкап создан (msg_id=%s)", msg.id)
+        # 1. Всегда шлём владельцу (визуальный контроль)
+        try:
+            old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (BACKUP_MSG_ID_KEY,)).fetchone()
+            if old_msg_id:
+                try:
+                    await client.edit_message(OWNER_ID, int(old_msg_id[0]), backup_text)
+                except:
+                    msg = await client.send_message(OWNER_ID, backup_text, parse_mode="html")
+                    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
+            else:
+                msg = await client.send_message(OWNER_ID, backup_text, parse_mode="html")
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
+            conn.commit()
+        except Exception as e:
+            log.warning("Не удалось отправить бэкап владельцу: %s", e)
+        
+        # 2. Сохраняем в канал вывода (бот админ → может читать при восстановлении)
+        target = get_output_chat() or FALLBACK_OUTPUT_CHAT
+        try:
+            await _save_backup_to_chat(target, backup_text)
+            log.info("💾 Бэкап сохранён в канал %s", target)
+        except Exception as e:
+            log.warning("Не удалось сохранить бэкап в канал %s: %s", target, e)
+            
     except Exception as e:
-        log.warning("Не удалось создать бэкап: %s", e)
+        log.warning("backup_settings_to_telegram: %s", e)
+
+async def _find_backup_in_chat(chat_id):
+    """Ищет бэкап среди последних 50 сообщений в чате"""
+    try:
+        msg_id_key = f"backup_msg_id_{chat_id}"
+        old_id = conn.execute("SELECT value FROM config WHERE key=?", (msg_id_key,)).fetchone()
+        
+        # Сначала пробуем по сохранённому msg_id (если БД не сброшена)
+        if old_id:
+            try:
+                msg = await client.get_messages(chat_id, ids=int(old_id[0]))
+                if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Thesaurus"):
+                    return msg.text
+            except Exception:
+                pass
+        
+        # Иначе листаем последние сообщения (бот-админ может читать историю канала)
+        async for msg in client.iter_messages(chat_id, limit=50):
+            if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Thesaurus"):
+                # Обновляем msg_id в БД для будущих обновлений
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (msg_id_key, str(msg.id)))
+                conn.commit()
+                return msg.text
+    except Exception as e:
+        log.warning("Не удалось прочитать бэкап из чата %s: %s", chat_id, e)
+    return None
 
 async def restore_settings_from_backup():
-    """Восстанавливает настройки из последнего бэкапа в Telegram"""
-    if not get_output_chat():
-        log.info("📦 Канал вывода не найден, ищу бэкап...")
-        old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (BACKUP_MSG_ID_KEY,)).fetchone()
-        if old_msg_id:
-            try:
-                msg = await client.get_messages(OWNER_ID, ids=int(old_msg_id[0]))
-                if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Thesaurus"):
-                    for line in msg.text.split("\n"):
-                        if line.startswith("output_chat="):
-                            val = line.split("=", 1)[1].strip()
-                            if val and val != "None":
-                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("output_chat", val))
-                                log.info("📦 Восстановлен канал вывода: %s", val)
-                        elif line.startswith("searchwords="):
-                            val = line.split("=", 1)[1].strip()
-                            if val:
-                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_search_keywords", val))
-                                log.info("📦 Восстановлены ключевые слова")
-                        elif line.startswith("phone="):
-                            val = line.split("=", 1)[1].strip()
-                            if val and val != "None":
-                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_phone", val))
-                                log.info("📦 Восстановлен телефон: %s", val)
-                        elif line.startswith("autosearch="):
-                            val = line.split("=", 1)[1].strip()
-                            if val:
-                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", val))
-                                log.info("📦 Восстановлен автопоиск: %s", val)
-                    conn.commit()
-                    return True
-            except Exception as e:
-                log.warning("Не удалось восстановить из бэкапа: %s", e)
-        
-        # Если нет msg_id в БД, ищем последнее сообщение с бэкапом в чате (без поиска)
-        try:
-            async for msg in client.iter_messages(OWNER_ID, limit=50):
-                if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Thesaurus"):
-                    for line in msg.text.split("\n"):
-                        if line.startswith("output_chat="):
-                            val = line.split("=", 1)[1].strip()
-                            if val and val != "None":
-                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("output_chat", val))
-                        elif line.startswith("searchwords="):
-                            val = line.split("=", 1)[1].strip()
-                            if val:
-                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_search_keywords", val))
-                        elif line.startswith("phone="):
-                            val = line.split("=", 1)[1].strip()
-                            if val and val != "None":
-                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_phone", val))
-                        elif line.startswith("autosearch="):
-                            val = line.split("=", 1)[1].strip()
-                            if val:
-                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", val))
-                    conn.commit()
-                    # Сохраняем msg_id для будущих обновлений
-                    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
-                    conn.commit()
-                    log.info("📦 Настройки восстановлены из последнего бэкапа (msg_id=%s)", msg.id)
-                    return True
-        except Exception as e:
-            log.warning("Не удалось найти бэкап: %s", e)
+    """Восстанавливает настройки из бэкапа в канале вывода (бот админ — может читать)"""
+    log.info("📦 Ищу бэкап для восстановления настроек...")
     
+    # Пробуем найти бэкап в канале вывода (или в FALLBACK_OUTPUT_CHAT)
+    target = get_output_chat() or FALLBACK_OUTPUT_CHAT
+    backup_text = await _find_backup_in_chat(target)
+    if backup_text:
+        if _parse_backup_lines(backup_text):
+            log.info("📦 Настройки восстановлены из бэкапа в канале %s", target)
+            return True
+    
+    # Если в канале не нашли, пробуем в личке владельца (на случай если канал недоступен)
+    log.info("📦 Бэкап в канале не найден, ищу в личке владельца...")
+    try:
+        async for msg in client.iter_messages(OWNER_ID, limit=50):
+            if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Thesaurus"):
+                # Сохраняем msg_id для будущих обновлений
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
+                conn.commit()
+                if _parse_backup_lines(msg.text):
+                    log.info("📦 Настройки восстановлены из бэкапа в личке (msg_id=%s)", msg.id)
+                    return True
+    except Exception as e:
+        log.warning("Не удалось прочитать бэкап из лички: %s", e)
+    
+    log.info("📦 Бэкап не найден")
     return False
 async def health_server():
     async def handler(reader, writer):
