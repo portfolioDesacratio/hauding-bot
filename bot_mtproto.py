@@ -532,7 +532,16 @@ async def cmd_reseed(event):
     msg = await safe_send(event.chat_id, "🔄 Очередь очищена, добавляю seed каналы...")
     await add_seed_channels()
     total = conn.execute("SELECT COUNT(*) FROM scrape_queue").fetchone()[0]
-    await safe_send(event.chat_id, f"✅ Добавлено {total} seed-каналов. Начинаю сбор.")
+    # Сохраняем ключевые слова
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                 ("user_search_keywords", DEFAULT_SEARCH_KEYWORDS))
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                 ("user_autosearch", "on"))
+    conn.commit()
+    await safe_send(event.chat_id,
+        f"✅ Добавлено {total} seed-каналов.\n"
+        f"🔍 Ключевые слова и автопоиск включены.\n"
+        f"Начинаю сбор.")
 
 # ─── Регистрация всех хендлеров ПОСЛЕ старта клиента ──────────────
 def register_handlers():
@@ -747,6 +756,21 @@ async def add_seed_channels():
         "troll_rus",
         "provokator",
         "provokation",
+        "trolls_army",
+        "trolls_of_russia",
+        "trolling_army",
+        "provokator_ru",
+        "trolling_world",
+        "trollworld",
+        "trolls_team",
+        "hard_trolling",
+        "trolling_hub",
+        "troll_artist",
+        "trolling_zone",
+        "trollbox",
+        "trolley",
+        "srrolling",
+        "srolling",
         # --- Хаудинг ---
         "hauding",
         "hauders",
@@ -754,12 +778,23 @@ async def add_seed_channels():
         "hauding_channel",
         "hauding_info",
         "hauding_rus",
+        "haud",
+        "haud_team",
+        "haud_army",
+        "ssauding",
+        "ssaud",
+        "sraud",
+        "ssauder",
+        "sraudinger",
         # --- Вбросы / фейки ---
         "vbros",
+        "vbros_ru",
         "feiki_net",
         "fake_news",
         "fakenews",
         "fakty_i_fake",
+        "vbroski",
+        "podbros",
         # --- Компромат ---
         "kompromat_group",
         "kompromat_ru",
@@ -767,23 +802,56 @@ async def add_seed_channels():
         "kompromat_xyz",
         "compromat",
         "kompromatt",
-        # --- Оккультизм / шаббат ---
+        "kompromat_top",
+        "kompromat24",
+        # --- Оккультизм ---
         "okkultizm",
         "okkult",
-        "shabbat",
         "okkult_ru",
+        "okkultizm_channel",
+        "okkultnii",
         "magiia",
-        # --- Прочие релевантные ---
-        "trolls_army",
-        "trolls_of_russia",
-        "trolling_army",
-        "provokator_ru",
+        "srakkultizm",
+        "srakkult",
+        "srakkult_ru",
+        # --- Шаббат ---
+        "shabbat",
+        "shabbat_ru",
+        "shabbes",
+        "srabbat",
+        "srabat",
+        "shabash",
+        # --- Кавалерия ---
+        "legkaya_kavaleriya",
+        "kavaleriya",
+        "kavaleri",
+        "ssavaleriya",
+        "sravvaleriya",
+        "light_cavalry",
+        # --- Ваффен / Срафен ---
+        "waffen",
+        "waffen_ru",
+        "ssraffen",
+        "waffen_ss",
+        "sraffen",
+        # --- Большие тексты ---
+        "big_texts",
+        "dlinnie_texti",
+        "mat_text",
+        "texts_with_mat",
+        "boshie_texti",
+        "ogromnie_texti",
+        # --- Прочие ---
+        "karahalk",
         "black_pr",
         "blackpr",
         "pr_black",
-        "trolling_world",
-        "trollworld",
-        "trolls_team",
+        "psihoz",
+        "psychosis",
+        "abuse_channel",
+        "abuse_text",
+        "trolling_moscow",
+        "trolling_spb",
     ]
     added = 0
     for ch in seed_channels:
@@ -858,10 +926,11 @@ async def init_user_client():
         return False
 
 DEFAULT_SEARCH_KEYWORDS = (
-    "новости, политика, война, украина, санкции, экономика, расследования, "
-    "коррупция, выборы, деньги, нефть, газ, кризис, троллинг, фейки, "
-    "пропаганда, медиа, телеграм, каналы, блогеры, оппозиция, власть, "
-    "кремль, путин, навальный, немцов, беларусь, кавказ, сибирь"
+    "троллинг, хауд, тролли, тролль, хаудинг, сраудинг, ссаудинг, ссауд, "
+    "срауд, сроллинг, сролль, сролли, оккультизм, сраккультизм, сракультизм, "
+    "срафен, ваффен, вафен, сраффен, сравалерия, ссавалерия, кавалерия, "
+    "легкая кавалерия, шаббат, сраббат, срабат, шабат, шаблоны, шаблон, "
+    "сраблон, сраблоны, сраготовки, заготовки"
 )
 
 async def cmd_auth(event):
