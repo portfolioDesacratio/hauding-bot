@@ -401,8 +401,12 @@ async def scrape_channel(username, resume_from=0):
     title = getattr(entity, "title", None) or username
     saved = processed = 0; last_id = resume_from
     log.info("📡 @%s с msg#%d...", username, resume_from)
-    conn.execute("INSERT OR REPLACE INTO scrape_queue (username,title,status,last_msg_id) VALUES (?,?,'active',?)",
-                 (username, title, resume_from)); conn.commit()
+    exists = conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone()
+    if exists:
+        conn.execute("UPDATE scrape_queue SET status='active',last_msg_id=? WHERE username=?", (resume_from, username))
+    else:
+        conn.execute("INSERT INTO scrape_queue (username,title,status,last_msg_id) VALUES (?,?,'active',?)", (username, title, resume_from))
+    conn.commit()
     try:
         async for msg in client.iter_messages(entity, min_id=resume_from, reverse=True, wait_time=2):
             processed += 1; last_id = msg.id
@@ -432,14 +436,27 @@ async def scrape_channel(username, resume_from=0):
     return saved
 
 async def queue_worker():
+    """Постоянно сканирует каналы: сначала pending (история), потом циклично done (новые сообщения)"""
+    _cycle_offset = 0
     while True:
         if not _scanning:
             await asyncio.sleep(5); continue
         try:
+            # Сначала обрабатываем новые (pending) каналы
             row = conn.execute("SELECT username,last_msg_id FROM scrape_queue WHERE status='pending' ORDER BY added_at LIMIT 1").fetchone()
             if row:
                 await scrape_channel(row[0], row[1])
-                await asyncio.sleep(30)
+                await asyncio.sleep(10)
+                continue
+
+            # Нет pending — циклично перепроверяем done-каналы (подхватываем новые сообщения)
+            all_done = conn.execute("SELECT username,last_msg_id FROM scrape_queue WHERE status='done' ORDER BY username").fetchall()
+            if all_done:
+                _cycle_offset = (_cycle_offset + 1) % len(all_done)
+                ch, last_id = all_done[_cycle_offset]
+                log.info("🔄 Перепроверяю @%s (новые после #%d)...", ch, last_id)
+                await scrape_channel(ch, last_id)
+                await asyncio.sleep(15)
             else:
                 await asyncio.sleep(10)
         except Exception as e:
