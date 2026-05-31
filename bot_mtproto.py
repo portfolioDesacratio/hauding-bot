@@ -189,14 +189,18 @@ async def on_msg(event):
 # ─── Обработчик добавления в чат ───────────────────────────────────
 async def on_chat_action(event):
     try:
-        if event.user_added and event.user_id and event.user_id == (await client.get_me()).id:
+        me = await client.get_me()
+        if event.user_added and event.user_id and event.user_id == me.id:
             chat = await event.get_chat()
             title = getattr(chat, "title", None) or "?"
             log.info("➕ Добавлен в чат: %s (%d)", title, event.chat_id)
-            if not getattr(chat, "username", None):
-                conn.execute("INSERT OR IGNORE INTO config (key,value) VALUES (?,?)",
-                             ("chat_" + str(event.chat_id), title))
-                conn.commit()
+            # Сохраняем ID канала — пригодится для /set_output
+            conn.execute("INSERT OR IGNORE INTO config (key,value) VALUES (?,?)",
+                         ("added_chat_" + str(event.chat_id), title))
+            conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                         ("last_added_chat", str(event.chat_id)))
+            conn.commit()
+            log.info("➕ Сохранён ID канала %d (%s). Используй /set_output в ЛС.", event.chat_id, title)
     except Exception as e:
         log.exception("on_chat_action: %s", e)
 
@@ -368,16 +372,29 @@ async def cmd_set_output(event):
             await safe_send(event.chat_id,
                 f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
         else:
-            # /set_output — текущий чат (только ЛС)
+            # /set_output без аргументов
             if not event.is_private:
                 await safe_send(event.chat_id, "❌ В канале не сработает. Напиши /set_output @username_канала в ЛС.")
                 return
-            chat = await event.get_chat()
-            chat_id = event.chat_id
-            title = getattr(chat, "title", None) or getattr(chat, "username", None) or "этот чат"
-            set_output_chat(chat_id)
-            await safe_send(event.chat_id,
-                f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
+            # Сначала проверяем: есть ли канал, куда бота недавно добавили?
+            cur = conn.execute("SELECT value FROM config WHERE key='last_added_chat'")
+            row = cur.fetchone()
+            if row:
+                last_chat_id = int(row[0])
+                cur2 = conn.execute("SELECT value FROM config WHERE key=?", ("added_chat_" + str(last_chat_id),))
+                row2 = cur2.fetchone()
+                title = row2[0] if row2 else "канал"
+                set_output_chat(last_chat_id)
+                await safe_send(event.chat_id,
+                    f"✅ <b>{title}</b> назначен каналом вывода (последний добавленный).\nВсе тексты будут отправляться сюда.")
+            else:
+                # Используем текущий чат
+                chat = await event.get_chat()
+                chat_id = event.chat_id
+                title = getattr(chat, "title", None) or getattr(chat, "username", None) or "этот чат"
+                set_output_chat(chat_id)
+                await safe_send(event.chat_id,
+                    f"✅ <b>{title}</b> назначен каналом вывода.\nВсе тексты будут отправляться сюда.")
     except Exception as e:
         log.exception("cmd_set_output: %s", e)
 
