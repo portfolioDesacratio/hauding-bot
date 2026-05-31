@@ -20,10 +20,13 @@ if env_path.exists():
                 os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-RENDER_URL = os.getenv("RENDER_URL", "").rstrip("/")
+
+# Auto‑detect Render by checking for Render's env variables
+IS_RENDER = os.getenv("RENDER") == "true"
+RENDER_URL = os.getenv("RENDER_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
+RENDER_URL = RENDER_URL.rstrip("/")
 WEBHOOK_URL = f"{RENDER_URL}/webhook" if RENDER_URL else None
 PORT = int(os.getenv("PORT", 8080))
-IS_RENDER = bool(RENDER_URL)
 
 if not BOT_TOKEN: log.error("Задай BOT_TOKEN"); sys.exit(1)
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "data"))
