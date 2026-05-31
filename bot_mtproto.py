@@ -62,10 +62,38 @@ def get_output_chat():
 def set_output_chat(chat_id):
     conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("output_chat", str(chat_id)))
     conn.commit()
+    asyncio.create_task(backup_settings_to_telegram())
+
+def get_search_keywords():
+    """Возвращает список ключевых слов для фильтрации (нижний регистр)"""
+    row = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
+    if not row: return []
+    # Разбиваем по запятой, чистим, нижний регистр
+    return [w.strip().lower() for w in row[0].split(",") if w.strip()]
+
+def text_matches_keywords(text):
+    """Проверяет, содержит ли текст хотя бы одно ключевое слово"""
+    keywords = get_search_keywords()
+    if not keywords:
+        return True  # если нет ключевых слов — пропускаем всё (для обратной совместимости)
+    text_lower = text.lower()
+    for kw in keywords:
+        if kw in text_lower:
+            return True
+    return False
+
+# Каналы, которые НЕ надо обрабатывать
+EXCLUDED_CHANNELS = {"desacratio", "thesaurus"}
 
 def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     content = content.strip()
     if not content or wc(content) < MIN_WORDS: return False
+    
+    # Фильтр по ключевым словам
+    if not text_matches_keywords(content):
+        log.debug("⏭️ Пропущен текст (нет ключевых слов): %d слов из %s", wc(content), chat_title)
+        return False
+    
     words = wc(content)
     conn.execute("INSERT INTO texts (content,source_chat,source_chat_title,source_message_id,source_link,word_count) VALUES (?,?,?,?,?,?)",
                  (content, chat_id, chat_title, msg_id, link, words))
@@ -78,7 +106,105 @@ client = TelegramClient(session_path, API_ID, API_HASH)
 RE_LINK = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_+\-]{3,})')
 _scanning = True
 
-# ─── Health‑check HTTP (Render) ──────────────────────────────────────
+# ─── Бэкап настроек в Telegram (чтобы не слетало после редеплоя) ──
+BACKUP_MSG_ID_KEY = "backup_msg_id"
+
+async def backup_settings_to_telegram():
+    """Сохраняет текущие настройки в сообщение владельцу"""
+    try:
+        out = get_output_chat()
+        kw = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
+        phone = conn.execute("SELECT value FROM config WHERE key='user_phone'").fetchone()
+        auto = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
+        lines = ["📦 Бэкап настроек Thesaurus"]
+        if out: lines.append(f"output_chat={out}")
+        if kw: lines.append(f"searchwords={kw[0]}")
+        if phone: lines.append(f"phone={phone[0]}")
+        if auto: lines.append(f"autosearch={auto[0]}")
+        backup_text = "\n".join(lines)
+        
+        old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (BACKUP_MSG_ID_KEY,)).fetchone()
+        if old_msg_id:
+            try:
+                await client.edit_message(OWNER_ID, int(old_msg_id[0]), backup_text)
+                log.info("💾 Бэкап обновлён (msg_id=%s)", old_msg_id[0])
+                return
+            except:
+                pass
+        # Если не получилось отредактировать — шлём новое
+        msg = await client.send_message(OWNER_ID, backup_text, parse_mode="html")
+        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
+        conn.commit()
+        log.info("💾 Бэкап создан (msg_id=%s)", msg.id)
+    except Exception as e:
+        log.warning("Не удалось создать бэкап: %s", e)
+
+async def restore_settings_from_backup():
+    """Восстанавливает настройки из последнего бэкапа в Telegram"""
+    if not get_output_chat():
+        log.info("📦 Канал вывода не найден, ищу бэкап...")
+        old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (BACKUP_MSG_ID_KEY,)).fetchone()
+        if old_msg_id:
+            try:
+                msg = await client.get_messages(OWNER_ID, ids=int(old_msg_id[0]))
+                if msg and msg.text:
+                    for line in msg.text.split("\n"):
+                        if line.startswith("output_chat="):
+                            val = line.split("=", 1)[1].strip()
+                            if val and val != "None":
+                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("output_chat", val))
+                                log.info("📦 Восстановлен канал вывода: %s", val)
+                        elif line.startswith("searchwords="):
+                            val = line.split("=", 1)[1].strip()
+                            if val:
+                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_search_keywords", val))
+                                log.info("📦 Восстановлены ключевые слова")
+                        elif line.startswith("phone="):
+                            val = line.split("=", 1)[1].strip()
+                            if val and val != "None":
+                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_phone", val))
+                                log.info("📦 Восстановлен телефон: %s", val)
+                        elif line.startswith("autosearch="):
+                            val = line.split("=", 1)[1].strip()
+                            if val:
+                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", val))
+                                log.info("📦 Восстановлен автопоиск: %s", val)
+                    conn.commit()
+                    return True
+            except Exception as e:
+                log.warning("Не удалось восстановить из бэкапа: %s", e)
+        
+        # Если нет msg_id в БД, ищем последнее сообщение с бэкапом в чате
+        try:
+            async for msg in client.iter_messages(OWNER_ID, limit=20, search="📦 Бэкап настроек Thesaurus"):
+                if msg and msg.text:
+                    for line in msg.text.split("\n"):
+                        if line.startswith("output_chat="):
+                            val = line.split("=", 1)[1].strip()
+                            if val and val != "None":
+                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("output_chat", val))
+                        elif line.startswith("searchwords="):
+                            val = line.split("=", 1)[1].strip()
+                            if val:
+                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_search_keywords", val))
+                        elif line.startswith("phone="):
+                            val = line.split("=", 1)[1].strip()
+                            if val and val != "None":
+                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_phone", val))
+                        elif line.startswith("autosearch="):
+                            val = line.split("=", 1)[1].strip()
+                            if val:
+                                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", val))
+                    conn.commit()
+                    # Сохраняем msg_id для будущих обновлений
+                    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
+                    conn.commit()
+                    log.info("📦 Настройки восстановлены из последнего бэкапа (msg_id=%s)", msg.id)
+                    return True
+        except Exception as e:
+            log.warning("Не удалось найти бэкап: %s", e)
+    
+    return False
 async def health_server():
     async def handler(reader, writer):
         try:
@@ -158,6 +284,17 @@ async def on_msg(event):
         msg = event.message
         chat = await event.get_chat()
         title = getattr(chat, "title", None) or getattr(chat, "username", None) or "?"
+        chat_username = getattr(chat, "username", "").lower()
+        
+        # Пропускаем исключённые каналы (свой канал, канал вывода и т.д.)
+        if chat_username in EXCLUDED_CHANNELS:
+            log.debug("⏭️ Пропущен исключённый канал: @%s", chat_username)
+            return
+        # Пропускаем канал вывода
+        out_ch = get_output_chat()
+        if out_ch and chat.id == out_ch:
+            return
+        
         log.info("📩 Сообщение от %s: «%s»", title, (msg.text or "")[:120])
 
         # Сохраняем и отправляем текст ≥50 слов
@@ -627,6 +764,21 @@ async def scrape_channel(username, resume_from=0, retries=0):
         log.warning("⚠️ @%s ошибка: %s", username, e)
         return -1
     title = getattr(entity, "title", None) or username
+    
+    # Пропускаем исключённые каналы
+    entity_username = getattr(entity, "username", "").lower()
+    if entity_username in EXCLUDED_CHANNELS:
+        log.info("⏭️ @%s в списке исключённых, пропускаю", username)
+        conn.execute("UPDATE scrape_queue SET status='done' WHERE username=?", (username,))
+        conn.commit()
+        return 0
+    out_ch = get_output_chat()
+    if out_ch and hasattr(entity, "id") and entity.id == out_ch:
+        log.info("⏭️ @%s это канал вывода, пропускаю", username)
+        conn.execute("UPDATE scrape_queue SET status='done' WHERE username=?", (username,))
+        conn.commit()
+        return 0
+    
     saved = processed = 0; last_id = resume_from
     log.info("📡 [%s] @%s с msg#%d...", reader_type, username, resume_from)
     exists = conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone()
@@ -856,16 +1008,12 @@ async def add_seed_channels():
     added = 0
     for ch in seed_channels:
         try:
-            entity = await client.get_entity(ch)
-            if hasattr(entity, "title"):
-                title = getattr(entity, "title", None) or ch
-                conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (ch, title))
-                conn.commit()
-                added += 1
-                log.info("  ➕ @%s — %s", ch, title)
-            await asyncio.sleep(2)
+            conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (ch, ch))
+            conn.commit()
+            added += 1
+            log.info("  ➕ @%s", ch)
         except Exception as e:
-            log.warning("  ⚠️ @%s: %s", ch, e)  # warning, not debug, чтобы видеть
+            log.warning("  ⚠️ @%s: %s", ch, e)
     log.info("📡 Добавлено %d начальных каналов", added)
 
 # ─── User‑клиент (твой аккаунт) для Search API ───────────────────────
@@ -1112,10 +1260,12 @@ async def cmd_autosearch(event):
         conn.commit()
         await safe_send(event.chat_id, "✅ Автопоиск включён. Каждые 6 часов бот ищет новые каналы.")
         asyncio.create_task(user_searcher())
+        asyncio.create_task(backup_settings_to_telegram())
     elif raw in ("off", "выкл", "нет", "no", "0"):
         conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", "off"))
         conn.commit()
         await safe_send(event.chat_id, "⏸ Автопоиск выключен.")
+        asyncio.create_task(backup_settings_to_telegram())
     elif raw == "status":
         st = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
         kws = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
@@ -1138,6 +1288,7 @@ async def cmd_searchwords(event):
     conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_search_keywords", words))
     conn.commit()
     await safe_send(event.chat_id, f"✅ Ключевые слова сохранены:\n{words}")
+    asyncio.create_task(backup_settings_to_telegram())
     # Если автопоиск включён — запускаем поиск немедленно
     as_on = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
     if as_on and as_on[0] == "on":
@@ -1253,6 +1404,16 @@ async def main():
     else:
         log.info("🖥 Локальный режим")
     log.info("=" * 50)
+
+    # Восстанавливаем настройки из бэкапа Telegram, если локально ничего нет
+    texts_count = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
+    if texts_count == 0 and not get_output_chat():
+        log.info("📦 База пуста, пробую восстановить из бэкапа Telegram...")
+        restored = await restore_settings_from_backup()
+        if restored:
+            log.info("📦 Настройки восстановлены из бэкапа!")
+        else:
+            log.info("📦 Бэкап не найден, всё придётся настроить заново")
 
     # Восстанавливаем настройки и шлём уведомление владельцу
     restored_settings = []
