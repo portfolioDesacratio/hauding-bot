@@ -163,7 +163,7 @@ async def restore_settings_from_backup():
         if old_msg_id:
             try:
                 msg = await client.get_messages(OWNER_ID, ids=int(old_msg_id[0]))
-                if msg and msg.text:
+                if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Thesaurus"):
                     for line in msg.text.split("\n"):
                         if line.startswith("output_chat="):
                             val = line.split("=", 1)[1].strip()
@@ -190,10 +190,10 @@ async def restore_settings_from_backup():
             except Exception as e:
                 log.warning("Не удалось восстановить из бэкапа: %s", e)
         
-        # Если нет msg_id в БД, ищем последнее сообщение с бэкапом в чате
+        # Если нет msg_id в БД, ищем последнее сообщение с бэкапом в чате (без поиска)
         try:
-            async for msg in client.iter_messages(OWNER_ID, limit=20, search="📦 Бэкап настроек Thesaurus"):
-                if msg and msg.text:
+            async for msg in client.iter_messages(OWNER_ID, limit=50):
+                if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Thesaurus"):
                     for line in msg.text.split("\n"):
                         if line.startswith("output_chat="):
                             val = line.split("=", 1)[1].strip()
@@ -1221,6 +1221,7 @@ async def cmd_code(event):
             "Поставь ключевые слова: /searchwords слово1, слово2\n"
             "Включи автопоиск: /autosearch on")
         asyncio.create_task(user_searcher())
+        _requeue_bot_errors()
     except errors.SessionPasswordNeededError:
         await safe_send(event.chat_id, "🔑 Нужен пароль 2FA: /2fa твой_пароль")
     except errors.FloodWaitError as e:
@@ -1242,6 +1243,7 @@ async def cmd_2fa(event):
             "Ключевые слова: /searchwords слово1, слово2\n"
             "Автопоиск: /autosearch on")
         asyncio.create_task(user_searcher())
+        _requeue_bot_errors()
     except errors.FloodWaitError as e:
         await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
     except Exception as e:
@@ -1285,6 +1287,7 @@ async def on_auth_digit(event):
                 "Ключевые слова: /searchwords слово1, слово2\n"
                 "Автопоиск: /autosearch on")
             asyncio.create_task(user_searcher())
+            _requeue_bot_errors()
         except errors.SessionPasswordNeededError:
             await safe_send(event.chat_id, "🔑 Нужен пароль 2FA: /2fa твой_пароль")
         except errors.PhoneCodeInvalidError:
@@ -1333,6 +1336,16 @@ async def cmd_search_channels(event):
         await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
     except Exception as e:
         await safe_send(event.chat_id, f"❌ Ошибка поиска: {str(e)[:200]}")
+
+def _requeue_bot_errors():
+    """После авторизации user-клиента перезапускаем каналы, 
+       которые не смогли прочитаться из-за отсутствия user-клиента"""
+    count = conn.execute(
+        "UPDATE scrape_queue SET status='pending',error=NULL WHERE status='error' AND error LIKE '%Bot cannot read%'"
+    ).rowcount
+    if count:
+        conn.commit()
+        log.info("🔄 Перезапущено %d каналов (были ошибки Bot cannot read)", count)
 
 async def cmd_autosearch(event):
     if not is_owner(event): return
