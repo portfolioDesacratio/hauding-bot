@@ -226,6 +226,20 @@ async def heartbeat():
                  conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0],
                  conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0])
 
+async def self_pinger():
+    """Пингует Render URL каждые 5 минут, чтобы контейнер не уснул"""
+    if not IS_RENDER:
+        return
+    ping_url = RENDER_URL or f"http://localhost:{PORT}"
+    while True:
+        await asyncio.sleep(300)  # 5 минут
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: __import__('urllib').request.urlopen(ping_url, timeout=10))
+            log.debug("🏓 Self-ping OK")
+        except Exception as e:
+            log.debug("🏓 Self-ping: %s", e)
+
 # ─── Отправка в выходной канал (с глобальным rate limit) ──────────
 _last_send_time = 0.0
 _send_lock = asyncio.Lock()
@@ -374,7 +388,8 @@ async def cmd_start(event):
             "Нахожу новые каналы через ссылки в сообщениях.\n\n"
             "Команды:\n"
             "/stats — статистика\n"
-            "/add &lt;username&gt; — добавить канал\n"
+            "/add &lt;username&gt; — добавить канал (или /add +invite для приватных)\n"
+            "/remove &lt;username&gt; — удалить канал\n"
             "/queue — очередь каналов\n"
             "/search &lt;слова&gt; — поиск\n"
             "/export — скачать всё\n"
@@ -420,14 +435,52 @@ async def cmd_add(event):
         if not is_owner(event): return
         raw = event.pattern_match.group(1).strip().lower()
         username = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', raw).split('/')[0].split('?')[0]
-        if not username or username.startswith("+"):
-            await safe_send(event.chat_id, "❌ Приватная ссылка. Добавь бота в канал админом.")
+        
+        # Приватная ссылка t.me/+xxx или +xxx
+        if username.startswith("+") or raw.startswith("t.me/+") or raw.startswith("https://t.me/+"):
+            invite_hash = username.lstrip("+")
+            await safe_send(event.chat_id, f"🔑 Пробую открыть приватную ссылку...")
+            try:
+                uc = get_user_client()
+                if not uc.is_connected():
+                    await uc.connect()
+                if not await uc.is_user_authorized():
+                    await safe_send(event.chat_id, "❌ User клиент не авторизован. Сначала /auth")
+                    return
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                result = await uc(CheckChatInviteRequest(invite_hash))
+                if hasattr(result, 'chat'):
+                    entity = result.chat
+                    ch_username = getattr(entity, 'username', None) or f"priv_{invite_hash}"
+                    ch_title = getattr(entity, 'title', None) or ch_username
+                    conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (ch_username, ch_title))
+                    conn.commit()
+                    await safe_send(event.chat_id, f"📡 <b>{ch_title}</b> (приватный) добавлен в очередь.")
+                else:
+                    await safe_send(event.chat_id, "❌ Ты не участник этого канала/группы. Вступи сначала.")
+                    # Если не участник, можно попробовать вступить:
+                    # from telethon.tl.functions.messages import ImportChatInviteRequest
+                    # await uc(ImportChatInviteRequest(invite_hash))
+            except Exception as e:
+                await safe_send(event.chat_id, f"❌ Ошибка приватной ссылки: {str(e)[:200]}")
+            return
+        
+        if not username:
+            await safe_send(event.chat_id, "❌ Укажи @username канала.")
             return
         if conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone():
             await safe_send(event.chat_id, f"ℹ️ @{username} уже в очереди.")
             return
         try:
-            entity = await client.get_entity(username)
+            # Сначала пробуем через user client (он видит приватные каналы где ты участник)
+            uc = get_user_client()
+            try:
+                if await uc.is_user_authorized():
+                    entity = await uc.get_entity(username)
+                else:
+                    entity = await client.get_entity(username)
+            except:
+                entity = await client.get_entity(username)
             if not hasattr(entity, "title"):
                 await safe_send(event.chat_id, f"❌ @{username} — не канал.")
                 return
@@ -457,6 +510,18 @@ async def cmd_queue(event):
         await safe_send(event.chat_id, "\n".join(lines))
     except Exception as e:
         log.exception("cmd_queue: %s", e)
+
+async def cmd_remove(event):
+    """Удалить канал из очереди"""
+    if not is_owner(event): return
+    raw = event.pattern_match.group(1).strip().lower()
+    username = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', raw).split('/')[0].split('?')[0]
+    if conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone():
+        conn.execute("DELETE FROM scrape_queue WHERE username=?", (username,))
+        conn.commit()
+        await safe_send(event.chat_id, f"🗑 @{username} удалён из очереди.")
+    else:
+        await safe_send(event.chat_id, f"❌ @{username} нет в очереди.")
 
 async def cmd_search(event):
     try:
@@ -705,6 +770,7 @@ def register_handlers():
     client.add_event_handler(cmd_debug, events.NewMessage(pattern=r"^/debug$"))
     client.add_event_handler(cmd_data_dir, events.NewMessage(pattern=r"^/data_dir$"))
     client.add_event_handler(cmd_reseed, events.NewMessage(pattern=r"^/reseed$"))
+    client.add_event_handler(cmd_remove, events.NewMessage(pattern=r"^/remove\s+(.+)"))
 
     # User client команды
     client.add_event_handler(cmd_auth, events.NewMessage(pattern=r"^/auth$"))
@@ -1433,6 +1499,7 @@ async def main():
 
     # Фоновые задачи
     asyncio.create_task(heartbeat())
+    asyncio.create_task(self_pinger())
     asyncio.create_task(queue_worker())
     asyncio.create_task(init_user_client())
     total_q = conn.execute("SELECT COUNT(*) FROM scrape_queue").fetchone()[0]
