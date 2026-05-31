@@ -616,47 +616,76 @@ async def scrape_channel(username, resume_from=0, retries=0):
     return saved
 
 async def queue_worker():
-    """Постоянно сканирует каналы: сначала pending (история), потом циклично done (новые сообщения)"""
-    _cycle_offset = 0
-    _iteration = 0
-    log.info("🚀 Queue worker запущен")
+    """Постоянно сканирует каналы: до MAX_CONCURRENT каналов одновременно"""
+    MAX_CONCURRENT = 3
+    active_tasks = {}  # username -> task
+    log.info("🚀 Queue worker запущен (до %d параллельно)", MAX_CONCURRENT)
+
+    async def run_scrape(username, last_msg_id):
+        """Обёртка для scrape_channel с таймаутом"""
+        try:
+            result = await asyncio.wait_for(scrape_channel(username, last_msg_id), timeout=600)
+            return result
+        except asyncio.TimeoutError:
+            log.error("⏰ @%s: таймаут 600с", username)
+            conn.execute("UPDATE scrape_queue SET status='error',error='Timeout' WHERE username=?", (username,))
+            conn.commit()
+            return -1
+        except Exception as e:
+            log.exception("run_scrape @%s: %s", username, e)
+            return -1
+
     while True:
+        # Пульс воркера каждые 5с
+        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                     ("qw_heartbeat", datetime.now().isoformat()))
+        conn.commit()
+
         if not _scanning:
             await asyncio.sleep(5); continue
-        _iteration += 1
-        # Публикуем пульс воркера (для /debug)
-        if _iteration % 10 == 0:
-            conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
-                         ("qw_heartbeat", datetime.now().isoformat()))
-            conn.commit()
-        try:
-            # Сначала обрабатываем новые (pending) каналы
-            row = conn.execute("SELECT username,last_msg_id FROM scrape_queue WHERE status='pending' ORDER BY added_at LIMIT 1").fetchone()
-            if row:
-                log.info("🚀 Queue: беру @%s (last_msg_id=%s)", row[0], row[1])
-                try:
-                    result = await asyncio.wait_for(scrape_channel(row[0], row[1]), timeout=300)
-                except asyncio.TimeoutError:
-                    log.error("⏰ @%s: таймаут 300с, помечаю error", row[0])
-                    conn.execute("UPDATE scrape_queue SET status='error',error='Timeout 300s' WHERE username=?", (row[0],))
-                    conn.commit()
-                    result = -1
-                log.info("🚀 Queue: @%s завершён, результат=%s", row[0], result)
-                await asyncio.sleep(15)
-                continue
 
-            # Нет pending — циклично перепроверяем done-каналы (подхватываем новые сообщения)
-            all_done = conn.execute("SELECT username,last_msg_id FROM scrape_queue WHERE status='done' ORDER BY username").fetchall()
-            if all_done:
-                _cycle_offset = (_cycle_offset + 1) % len(all_done)
-                ch, last_id = all_done[_cycle_offset]
-                log.info("🔄 Перепроверяю @%s (новые после #%d)...", ch, last_id)
-                await scrape_channel(ch, last_id)
-                await asyncio.sleep(20)
-            else:
-                await asyncio.sleep(15)
+        # Убираем завершённые задачи
+        finished = [u for u, t in list(active_tasks.items()) if t.done()]
+        for u in finished:
+            try:
+                r = active_tasks[u].result()
+                log.info("✅ @%s завершён (результат=%s)", u, r)
+            except Exception:
+                pass
+            del active_tasks[u]
+
+        try:
+            # Запускаем новые pending-каналы, пока есть место
+            running = len(active_tasks)
+            if running < MAX_CONCURRENT:
+                rows = conn.execute(
+                    "SELECT username,last_msg_id FROM scrape_queue WHERE status='pending' ORDER BY added_at LIMIT ?",
+                    (MAX_CONCURRENT - running,)
+                ).fetchall()
+                for row in rows:
+                    if row[0] not in active_tasks:
+                        task = asyncio.create_task(run_scrape(row[0], row[1]))
+                        active_tasks[row[0]] = task
+                        log.info("🚀 Запущен @%s (активно %d/%d)", row[0], len(active_tasks), MAX_CONCURRENT)
+
+            # Если ничего не запущено — перепроверяем done-канал
+            if not active_tasks:
+                done_ch = conn.execute(
+                    "SELECT username,last_msg_id FROM scrape_queue WHERE status='done' ORDER BY RANDOM() LIMIT 1"
+                ).fetchone()
+                if done_ch:
+                    task = asyncio.create_task(run_scrape(done_ch[0], done_ch[1]))
+                    active_tasks[done_ch[0]] = task
+                    log.info("🔄 Перепроверка @%s", done_ch[0])
+                else:
+                    log.info("⏳ Нет каналов для обработки, жду...")
+                    await asyncio.sleep(30)
+                    continue
+
+            await asyncio.sleep(3)
         except Exception as e:
-            log.exception("Очередь: %s", e); await asyncio.sleep(30)
+            log.exception("Queue worker: %s", e)
+            await asyncio.sleep(10)
 
 # ─── Seed-каналы для первого запуска ─────────────────────────────────
 async def add_seed_channels():
@@ -963,6 +992,11 @@ async def cmd_searchwords(event):
     conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_search_keywords", words))
     conn.commit()
     await safe_send(event.chat_id, f"✅ Ключевые слова сохранены:\n{words}")
+    # Если автопоиск включён — запускаем поиск немедленно
+    as_on = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
+    if as_on and as_on[0] == "on":
+        asyncio.create_task(user_searcher())
+        await safe_send(event.chat_id, "🔍 Запускаю поиск каналов по этим словам...")
 
 async def user_searcher():
     """Фоновая задача: ищет каналы по ключевым словам каждые 6 часов"""
