@@ -548,6 +548,11 @@ async def scrape_channel(username, resume_from=0, retries=0):
         log.warning("FloodWait @%s: %dс (попытка %d/5)", username, e.seconds, retries + 1)
         await asyncio.sleep(min(e.seconds, 30))
         return await scrape_channel(username, resume_from, retries + 1)
+    except errors.BotMethodInvalidError as e:
+        conn.execute("UPDATE scrape_queue SET status='error',error='Bot not allowed' WHERE username=?", (username,))
+        conn.commit()
+        log.warning("⚠️ @%s: бот не может получить entity", username)
+        return -1
     except Exception as e:
         conn.execute("UPDATE scrape_queue SET status='error',error=? WHERE username=?", (str(e)[:500], username))
         conn.commit()
@@ -584,6 +589,11 @@ async def scrape_channel(username, resume_from=0, retries=0):
             return saved
         await asyncio.sleep(min(e.seconds, 120))
         return await scrape_channel(username, last_id, retries + 1)
+    except errors.BotMethodInvalidError as e:
+        conn.execute("UPDATE scrape_queue SET status='error',error='Bot not allowed to read this channel' WHERE username=?", (username,))
+        conn.commit()
+        log.warning("⚠️ @%s: бот не может читать этот канал", username)
+        return saved
     except Exception as e:
         conn.execute("UPDATE scrape_queue SET status='error',error=?,last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                      (str(e)[:500], last_id, saved, username)); conn.commit()
@@ -612,7 +622,13 @@ async def queue_worker():
             row = conn.execute("SELECT username,last_msg_id FROM scrape_queue WHERE status='pending' ORDER BY added_at LIMIT 1").fetchone()
             if row:
                 log.info("🚀 Queue: беру @%s (last_msg_id=%s)", row[0], row[1])
-                result = await scrape_channel(row[0], row[1])
+                try:
+                    result = await asyncio.wait_for(scrape_channel(row[0], row[1]), timeout=300)
+                except asyncio.TimeoutError:
+                    log.error("⏰ @%s: таймаут 300с, помечаю error", row[0])
+                    conn.execute("UPDATE scrape_queue SET status='error',error='Timeout 300s' WHERE username=?", (row[0],))
+                    conn.commit()
+                    result = -1
                 log.info("🚀 Queue: @%s завершён, результат=%s", row[0], result)
                 await asyncio.sleep(10)
                 continue
