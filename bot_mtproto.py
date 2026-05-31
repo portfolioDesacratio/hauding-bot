@@ -100,10 +100,25 @@ async def heartbeat():
                  conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0],
                  conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0])
 
-# ─── Отправка в выходной канал ───────────────────────────────────────
+# ─── Отправка в выходной канал (с глобальным rate limit) ──────────
+_last_send_time = 0.0
+_send_lock = asyncio.Lock()
+
 async def send_to_output(text, source_title, source_link=None):
+    global _last_send_time
     out = get_output_chat()
     if not out: return
+
+    # Rate limit: не чаще 1 сообщения в 3 секунды
+    async with _send_lock:
+        now = asyncio.get_event_loop().time()
+        since_last = now - _last_send_time
+        if since_last < 3.0:
+            wait = 3.0 - since_last
+            log.debug("⏳ Rate limit send: жду %.1fс", wait)
+            await asyncio.sleep(wait)
+        _last_send_time = asyncio.get_event_loop().time()
+
     header = f"📡 <b>{source_title}</b>"
     if source_link: header += f"\n🔗 {source_link}"
     text_clean = text.replace("<", "&lt;").replace(">", "&gt;")
@@ -113,6 +128,9 @@ async def send_to_output(text, source_title, source_link=None):
     try:
         await client.send_message(out, message, parse_mode="html")
         log.info("📤 Отправлено в канал вывода")
+    except errors.FloodWaitError as e:
+        log.warning("⏳ FloodWait при отправке: %dс", e.seconds)
+        await asyncio.sleep(min(e.seconds, 10))
     except Exception as e:
         log.warning("Не отправилось в канал: %s", e)
 
@@ -226,7 +244,8 @@ async def cmd_start(event):
             "/set_output [@канал] — назначить канал вывода\n"
             "/pause — пауза\n"
             "/resume — продолжить\n"
-            "/debug — диагностика\n\n"
+            "/debug — диагностика\n"
+            "/data_dir — путь к данным\n\n"
             "🔍 Поиск каналов (user-клиент):\n"
             "/auth — авторизовать user-клиент\n"
             "/phone +7... — номер телефона\n"
@@ -492,6 +511,18 @@ async def cmd_debug(event):
     except Exception as e:
         log.exception("cmd_debug: %s", e)
 
+async def cmd_data_dir(event):
+    if not is_owner(event): return
+    session_file = Path(str(USER_SESSION) + ".session")
+    db_exists = Path(DB_PATH).exists()
+    session_exists = session_file.exists()
+    await safe_send(event.chat_id,
+        f"📁 <b>Хранилище данных</b>\n"
+        f"DATA_DIR: {DATA_DIR}\n"
+        f"База: {DB_PATH} {'✅' if db_exists else '❌'}\n"
+        f"Сессия user: {session_file} {'✅' if session_exists else '❌'}\n"
+        f"Render: {'✅' if IS_RENDER else '❌'}")
+
 # ─── Регистрация всех хендлеров ПОСЛЕ старта клиента ──────────────
 def register_handlers():
     """Добавляем обработчики событий через add_event_handler (не декораторы)"""
@@ -515,6 +546,7 @@ def register_handlers():
     client.add_event_handler(cmd_pause, events.NewMessage(pattern=r"^/pause$"))
     client.add_event_handler(cmd_resume, events.NewMessage(pattern=r"^/resume$"))
     client.add_event_handler(cmd_debug, events.NewMessage(pattern=r"^/debug$"))
+    client.add_event_handler(cmd_data_dir, events.NewMessage(pattern=r"^/data_dir$"))
 
     # User client команды
     client.add_event_handler(cmd_auth, events.NewMessage(pattern=r"^/auth$"))
@@ -761,17 +793,44 @@ async def init_user_client():
     """Проверяем сохранённую сессию при старте"""
     uc = get_user_client()
     session_file = Path(str(USER_SESSION) + ".session")
-    log.info("👤 User client: сессия %s (файл %s)",
-             "существует" if session_file.exists() else "НЕ существует",
-             session_file)
+    exists = session_file.exists()
+    log.info("👤 User client: сессия %s (файл %s)", "✅ существует" if exists else "❌ НЕТ", session_file)
+    log.info("📁 DATA_DIR: %s", DATA_DIR)
+    if not exists:
+        log.warning("👤 Файл сессии не найден — нужна /auth")
+        try:
+            await client.send_message(OWNER_ID,
+                "⚠️ <b>User client сессия не найдена</b>\n"
+                "Отправь:\n"
+                "/auth\n"
+                "/phone +79122502717\n"
+                "Далее код по цифрам: 1 2 3 4 5",
+                parse_mode="html")
+        except:
+            pass
+        return False
     try:
         await uc.connect()
         if await uc.is_user_authorized():
             log.info("👤 User client авторизован (сессия сохранена)")
             asyncio.create_task(user_searcher())
+            # Уведомляем что всё ок
+            try:
+                await client.send_message(OWNER_ID,
+                    "✅ <b>User client авторизован</b> (сессия восстановлена)",
+                    parse_mode="html")
+            except:
+                pass
             return True
         else:
             log.info("👤 User client: сессия недействительна, нужна /auth")
+            try:
+                await client.send_message(OWNER_ID,
+                    "⚠️ <b>User client сессия недействительна</b>\n"
+                    "Нужна переавторизация: /auth",
+                    parse_mode="html")
+            except:
+                pass
             return False
     except Exception as e:
         log.warning("👤 User client init error: %s", e)
@@ -1104,6 +1163,22 @@ async def main():
     else:
         log.info("🖥 Локальный режим")
     log.info("=" * 50)
+
+    # Восстанавливаем настройки и шлём уведомление владельцу
+    restored_settings = []
+    out_ch = get_output_chat()
+    if out_ch: restored_settings.append(f"📤 Канал вывода: {out_ch}")
+    kw = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
+    if kw: restored_settings.append(f"🔍 Ключевые слова: {kw[0][:60]}...")
+    auto = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
+    if auto: restored_settings.append(f"🔄 Автопоиск: {auto[0]}")
+    texts_count = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
+    restored_settings.append(f"📚 Текстов в базе: {texts_count}")
+    startup_msg = "🔄 <b>Бот перезапущен</b>\n" + "\n".join(f"• {s}" for s in restored_settings)
+    try:
+        await client.send_message(OWNER_ID, startup_msg, parse_mode="html")
+    except:
+        pass
 
     # Фоновые задачи
     asyncio.create_task(heartbeat())
