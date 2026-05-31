@@ -485,8 +485,8 @@ async def on_msg(event):
         title = getattr(chat, "title", None) or getattr(chat, "username", None) or "?"
         chat_username = getattr(chat, "username", "").lower()
         
-        # Пропускаем исключённые каналы (свой канал, канал вывода и т.д.)
-        if chat_username in EXCLUDED_CHANNELS:
+        # Пропускаем исключённые каналы (но не ЛС владельца — там файлы и команды)
+        if not event.is_private and chat_username in EXCLUDED_CHANNELS:
             log.debug("⏭️ Пропущен исключённый канал: @%s", chat_username)
             return
         # Пропускаем канал вывода
@@ -534,22 +534,25 @@ async def on_msg(event):
         if msg.document:
             try:
                 fn = msg.file.name or "unknown.txt"
-                if fn.endswith(".txt") or "text/plain" in (msg.file.mime_type or ""):
-                    fb = await msg.download_media(bytes=True)
-                    if not fb: fb = await client.download_file(msg.document, bytes=True)
-                    text_content = fb.decode("utf-8", errors="replace")
-                    
-                    # Если файл прислал владелец в ЛС — broadcast частями
-                    if event.is_private and event.sender_id == OWNER_ID:
-                        await broadcast_file(text_content, fn, event)
-                    else:
-                        # Старое поведение: абзацы в базу
-                        for b in re.split(r'\n\s*\n', text_content):
-                            if wc(b) >= MIN_WORDS:
-                                if save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
-                                    await send_to_output(b.strip(), title, f"file:{fn}")
+                if not (fn.endswith(".txt") or "text/plain" in (msg.file.mime_type or "")):
+                    return
+                fb = await msg.download_media(bytes=True)
+                if not fb: fb = await client.download_file(msg.document, bytes=True)
+                text_content = fb.decode("utf-8", errors="replace")
+                
+                # Если файл прислал владелец в ЛС — broadcast частями
+                if event.is_private and event.sender_id == OWNER_ID:
+                    await broadcast_file(text_content, fn, event)
+                else:
+                    # Старое поведение: абзацы в базу
+                    for b in re.split(r'\n\s*\n', text_content):
+                        if wc(b) >= MIN_WORDS:
+                            if save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
+                                await send_to_output(b.strip(), title, f"file:{fn}")
             except Exception as e:
                 log.error("Файл: %s", e)
+                if event.is_private and event.sender_id == OWNER_ID:
+                    await safe_send(event.chat_id, f"❌ Ошибка при обработке файла: {str(e)[:200]}")
     except Exception as e:
         log.exception("❌ on_msg: %s", e)
 
