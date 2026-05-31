@@ -159,12 +159,13 @@ async def on_msg(event):
 @client.on(events.NewMessage(pattern=r"^/start$"))
 async def cmd_start(event):
     await safe_send(event.chat_id,
-        "👋 <b>TEAM SPIRIT Collector (MTProto)</b>\n\n"
+        "👋 <b>Thesaurus Collector</b>\n\n"
         "Читаю публичные каналы без вступления.\n"
         "Ищу ссылки в сообщениях, сканирую историю.\n"
         "Пытаюсь зайти в закрытые чаты.\n\n"
         "Команды:\n"
         "/stats — статистика\n"
+        "/add <username> — добавить канал в очередь\n"
         "/queue — очередь каналов\n"
         "/search <слова> — поиск\n"
         "/export — скачать всё\n"
@@ -220,6 +221,34 @@ async def cmd_pause(event):
 async def cmd_resume(event):
     global _scanning; _scanning = True
     await safe_send(event.chat_id, "▶️ Продолжаем.")
+
+@client.on(events.NewMessage(pattern=r"^/add (.+)"))
+async def cmd_add(event):
+    """Добавить канал в очередь сканирования. /add username или t.me/username"""
+    raw = event.pattern_match.group(1).strip().lower()
+    # Извлекаем username из ссылки типа t.me/xxx, @xxx
+    username = re.sub(r'^(?:https?://)?(?:t\.me/|@)', '', raw).split('/')[0].split('?')[0]
+    if not username or username.startswith("+"):
+        await safe_send(event.chat_id, "❌ Это приватная ссылка. Добавь бота в канал админом.")
+        return
+    if conn.execute("SELECT 1 FROM scrape_queue WHERE username=?", (username,)).fetchone():
+        await safe_send(event.chat_id, f"ℹ️ @{username} уже в очереди.")
+        return
+    try:
+        entity = await client.get_entity(username)
+        if not hasattr(entity, "title"):
+            await safe_send(event.chat_id, f"❌ @{username} — не канал.")
+            return
+        title = getattr(entity, "title", None) or username
+        conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)", (username, title))
+        conn.commit()
+        await safe_send(event.chat_id, f"📡 <b>{title}</b> (@{username}) добавлен в очередь.")
+    except errors.UsernameNotOccupiedError:
+        await safe_send(event.chat_id, f"❌ @{username} не существует.")
+    except errors.FloodWaitError as e:
+        await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
+    except Exception as e:
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
 
 async def safe_send(chat_id, text, parse_mode="html"):
     try: await client.send_message(chat_id, text, parse_mode=parse_mode)
