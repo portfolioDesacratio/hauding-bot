@@ -225,7 +225,8 @@ async def cmd_start(event):
             "/export — скачать всё\n"
             "/set_output [@канал] — назначить канал вывода\n"
             "/pause — пауза\n"
-            "/resume — продолжить\n\n"
+            "/resume — продолжить\n"
+            "/debug — диагностика\n\n"
             "🔍 Поиск каналов (user-клиент):\n"
             "/auth — авторизовать user-клиент\n"
             "/phone +7... — номер телефона\n"
@@ -450,6 +451,47 @@ async def cmd_resume(event):
     except Exception as e:
         log.exception("cmd_resume: %s", e)
 
+async def cmd_debug(event):
+    try:
+        if not is_owner(event): return
+        total = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
+        q_pending = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0]
+        q_active = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='active'").fetchone()[0]
+        q_done = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='done'").fetchone()[0]
+        q_error = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='error'").fetchone()[0]
+        out = get_output_chat()
+        qw_hb = conn.execute("SELECT value FROM config WHERE key='qw_heartbeat'").fetchone()
+        authed = False
+        try:
+            uc = get_user_client()
+            authed = await uc.is_user_authorized()
+        except:
+            pass
+        # Первый pending канал
+        first = conn.execute("SELECT username,title FROM scrape_queue WHERE status='pending' ORDER BY added_at LIMIT 1").fetchone()
+        # Несколько последних error
+        errors = conn.execute("SELECT username,error FROM scrape_queue WHERE status='error' ORDER BY added_at DESC LIMIT 5").fetchall()
+        lines = [
+            f"🔍 <b>Debug</b>\n",
+            f"Текстов: {total}",
+            f"Очередь: ⏳{q_pending} 🔄{q_active} ✅{q_done} ❌{q_error}",
+            f"Канал вывода: {out if out else '❌'}",
+            f"Сканирование: {'▶️' if _scanning else '⏸'}",
+            f"Пульс воркера: {qw_hb[0] if qw_hb else 'нет'}",
+            f"User client: {'✅' if authed else '❌'}",
+        ]
+        if first:
+            lines.append(f"\nПервый в очереди: @{first[0]} ({first[1] or '?'})")
+        if errors:
+            lines.append("\nПоследние ошибки:")
+            for u, e in errors:
+                lines.append(f"  ❌ @{u}: {(e or '?')[:100]}")
+        if q_pending == 0 and q_active == 0 and q_done == 0:
+            lines.append("\n⚠️ Очередь пуста. Если это только что — seed channels ещё добавляются.")
+        await safe_send(event.chat_id, "\n".join(lines))
+    except Exception as e:
+        log.exception("cmd_debug: %s", e)
+
 # ─── Регистрация всех хендлеров ПОСЛЕ старта клиента ──────────────
 def register_handlers():
     """Добавляем обработчики событий через add_event_handler (не декораторы)"""
@@ -472,6 +514,7 @@ def register_handlers():
     client.add_event_handler(cmd_set_output, events.NewMessage(pattern=r"^/set_output(?:\s+(.+))?$"))
     client.add_event_handler(cmd_pause, events.NewMessage(pattern=r"^/pause$"))
     client.add_event_handler(cmd_resume, events.NewMessage(pattern=r"^/resume$"))
+    client.add_event_handler(cmd_debug, events.NewMessage(pattern=r"^/debug$"))
 
     # User client команды
     client.add_event_handler(cmd_auth, events.NewMessage(pattern=r"^/auth$"))
@@ -488,7 +531,12 @@ def register_handlers():
     log.info("✅ Зарегистрировано хендлеров: %d", eb_count)
 
 # ─── Сканирование истории канала ─────────────────────────────────────
-async def scrape_channel(username, resume_from=0):
+async def scrape_channel(username, resume_from=0, retries=0):
+    if retries > 5:
+        conn.execute("UPDATE scrape_queue SET status='error',error='Too many retries' WHERE username=?", (username,))
+        conn.commit()
+        log.error("❌ @%s: слишком много retries", username)
+        return -1
     try:
         entity = await client.get_entity(username)
     except errors.UsernameNotOccupiedError:
@@ -497,9 +545,9 @@ async def scrape_channel(username, resume_from=0):
         log.warning("⚠️ @%s не найден (username not occupied)", username)
         return -1
     except errors.FloodWaitError as e:
-        log.warning("FloodWait @%s: %dс", username, e.seconds)
-        await asyncio.sleep(min(e.seconds, 60))
-        return await scrape_channel(username, resume_from)
+        log.warning("FloodWait @%s: %dс (попытка %d/5)", username, e.seconds, retries + 1)
+        await asyncio.sleep(min(e.seconds, 30))
+        return await scrape_channel(username, resume_from, retries + 1)
     except Exception as e:
         conn.execute("UPDATE scrape_queue SET status='error',error=? WHERE username=?", (str(e)[:500], username))
         conn.commit()
@@ -530,9 +578,12 @@ async def scrape_channel(username, resume_from=0):
     except errors.FloodWaitError as e:
         conn.execute("UPDATE scrape_queue SET status='pending',last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                      (last_id, saved, username)); conn.commit()
-        log.warning("FloodWait @%s: %dс", username, e.seconds)
-        await asyncio.sleep(e.seconds)
-        return await scrape_channel(username, last_id)
+        log.warning("FloodWait @%s: %dс (внутри)", username, e.seconds)
+        if retries > 3:
+            log.error("❌ @%s: FloodWait слишком много раз, пропускаю", username)
+            return saved
+        await asyncio.sleep(min(e.seconds, 120))
+        return await scrape_channel(username, last_id, retries + 1)
     except Exception as e:
         conn.execute("UPDATE scrape_queue SET status='error',error=?,last_msg_id=?,total_saved=total_saved+? WHERE username=?",
                      (str(e)[:500], last_id, saved, username)); conn.commit()
@@ -545,14 +596,24 @@ async def scrape_channel(username, resume_from=0):
 async def queue_worker():
     """Постоянно сканирует каналы: сначала pending (история), потом циклично done (новые сообщения)"""
     _cycle_offset = 0
+    _iteration = 0
+    log.info("🚀 Queue worker запущен")
     while True:
         if not _scanning:
             await asyncio.sleep(5); continue
+        _iteration += 1
+        # Публикуем пульс воркера (для /debug)
+        if _iteration % 10 == 0:
+            conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                         ("qw_heartbeat", datetime.now().isoformat()))
+            conn.commit()
         try:
             # Сначала обрабатываем новые (pending) каналы
             row = conn.execute("SELECT username,last_msg_id FROM scrape_queue WHERE status='pending' ORDER BY added_at LIMIT 1").fetchone()
             if row:
-                await scrape_channel(row[0], row[1])
+                log.info("🚀 Queue: беру @%s (last_msg_id=%s)", row[0], row[1])
+                result = await scrape_channel(row[0], row[1])
+                log.info("🚀 Queue: @%s завершён, результат=%s", row[0], result)
                 await asyncio.sleep(10)
                 continue
 
@@ -567,7 +628,7 @@ async def queue_worker():
             else:
                 await asyncio.sleep(10)
         except Exception as e:
-            log.error("Очередь: %s", e); await asyncio.sleep(30)
+            log.exception("Очередь: %s", e); await asyncio.sleep(30)
 
 # ─── Seed-каналы для первого запуска ─────────────────────────────────
 async def add_seed_channels():
@@ -645,6 +706,10 @@ def get_user_client():
 async def init_user_client():
     """Проверяем сохранённую сессию при старте"""
     uc = get_user_client()
+    session_file = Path(str(USER_SESSION) + ".session")
+    log.info("👤 User client: сессия %s (файл %s)",
+             "существует" if session_file.exists() else "НЕ существует",
+             session_file)
     try:
         await uc.connect()
         if await uc.is_user_authorized():
@@ -655,7 +720,7 @@ async def init_user_client():
             log.info("👤 User client: сессия недействительна, нужна /auth")
             return False
     except Exception as e:
-        log.debug("User client init: %s", e)
+        log.warning("👤 User client init error: %s", e)
         return False
 
 DEFAULT_SEARCH_KEYWORDS = (
