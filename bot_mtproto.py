@@ -426,6 +426,10 @@ async def add_seed_channels():
 
 # ─── Главный запуск ──────────────────────────────────────────────────
 async def main():
+    # Запускаем health‑сервер ДО client.start(), чтобы Render не убил контейнер
+    if IS_RENDER:
+        asyncio.create_task(health_server())
+
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
     log.info("=" * 50)
@@ -437,8 +441,6 @@ async def main():
         log.info("🖥 Локальный режим")
     log.info("=" * 50)
 
-    if IS_RENDER:
-        asyncio.create_task(health_server())
     asyncio.create_task(queue_worker())
 
     total_q = conn.execute("SELECT COUNT(*) FROM scrape_queue").fetchone()[0]
