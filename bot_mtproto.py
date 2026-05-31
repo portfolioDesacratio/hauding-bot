@@ -5,7 +5,7 @@
 import asyncio, logging, os, re, sqlite3, sys
 from datetime import datetime
 from pathlib import Path
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, errors, events, functions
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
@@ -29,8 +29,7 @@ if not all([API_ID, API_HASH, BOT_TOKEN]):
 OWNER_ID = 8587090554  # @desacratio
 
 IS_RENDER = os.getenv("RENDER") == "true"
-RENDER_URL = os.getenv("RENDER_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
-RENDER_URL = RENDER_URL.rstrip("/")
+RENDER_URL = os.getenv("RENDER_URL") or os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", 8080))
 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).parent / "data"))
@@ -90,6 +89,14 @@ async def health_server():
     log.info("🏥 Health check на 0.0.0.0:%d", PORT)
     async with server: await server.serve_forever()
 
+# ─── Пульс (лог каждые 60с, чтобы видеть что бот жив) ──────────────
+async def heartbeat():
+    while True:
+        await asyncio.sleep(60)
+        log.info("💓 Пульс: база %d текстов, очередь %d pending",
+                 conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0],
+                 conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0])
+
 # ─── Отправка в выходной канал ───────────────────────────────────────
 async def send_to_output(text, source_title, source_link=None):
     out = get_output_chat()
@@ -106,8 +113,17 @@ async def send_to_output(text, source_title, source_link=None):
     except Exception as e:
         log.warning("Не отправилось в канал: %s", e)
 
-# ─── Обработчики сообщений ──────────────────────────────────────────
-@client.on(events.NewMessage)
+# ─── Проверка владельца ──────────────────────────────────────────────
+def is_owner(event):
+    return event.sender_id == OWNER_ID
+
+async def safe_send(chat_id, text, parse_mode="html"):
+    try:
+        await client.send_message(chat_id, text, parse_mode=parse_mode)
+    except Exception as e:
+        log.warning("Не отправилось: %s", e)
+
+# ─── Обработчик всех сообщений ─────────────────────────────────────
 async def on_msg(event):
     try:
         if event.out: return
@@ -115,7 +131,7 @@ async def on_msg(event):
         msg = event.message
         chat = await event.get_chat()
         title = getattr(chat, "title", None) or getattr(chat, "username", None) or "?"
-        log.info("📩 Сообщение от %s: «%s»", title, (msg.text or "")[:80])
+        log.info("📩 Сообщение от %s: «%s»", title, (msg.text or "")[:120])
 
         # Сохраняем и отправляем текст ≥50 слов
         if msg.text and wc(msg.text) >= MIN_WORDS:
@@ -133,7 +149,8 @@ async def on_msg(event):
                 if link.startswith("+"):
                     log.info("🔑 Пытаюсь зайти в %s из %s", link, title)
                     try:
-                        await client.join_chat(link)
+                        # Telethon 1.37+: join_chat через вызов API
+                        await client(functions.messages.ImportChatInviteRequest(hash=link[1:]))
                         log.info("✅ Зашёл в %s!", link)
                         conn.execute("INSERT OR IGNORE INTO scrape_queue (username,title) VALUES (?,?)",
                                      (link, f"private:{link}"))
@@ -163,7 +180,8 @@ async def on_msg(event):
             try:
                 fn = msg.file.name or "unknown.txt"
                 if fn.endswith(".txt") or "text/plain" in (msg.file.mime_type or ""):
-                    fb = await msg.download_media(bytes=True) or await client.download_file(msg.document, bytes=True)
+                    fb = await msg.download_media(bytes=True)
+                    if not fb: fb = await client.download_file(msg.document, bytes=True)
                     for b in re.split(r'\n\s*\n', fb.decode("utf-8", errors="replace")):
                         if wc(b) >= MIN_WORDS:
                             if save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
@@ -173,8 +191,7 @@ async def on_msg(event):
     except Exception as e:
         log.exception("❌ on_msg: %s", e)
 
-# ─── Добавление в чат ────────────────────────────────────────────────
-@client.on(events.ChatAction)
+# ─── Обработчик добавления в чат ───────────────────────────────────
 async def on_chat_action(event):
     try:
         if event.user_added and event.user_id and event.user_id == (await client.get_me()).id:
@@ -188,18 +205,7 @@ async def on_chat_action(event):
     except Exception as e:
         log.exception("on_chat_action: %s", e)
 
-# ─── Проверка владельца ──────────────────────────────────────────────
-def is_owner(event):
-    return event.sender_id == OWNER_ID
-
-async def safe_send(chat_id, text, parse_mode="html"):
-    try:
-        await client.send_message(chat_id, text, parse_mode=parse_mode)
-    except Exception as e:
-        log.warning("Не отправилось: %s", e)
-
-# ─── Команды (только для владельца) ──────────────────────────────────
-@client.on(events.NewMessage(pattern=r"^/start$"))
+# ─── Команды для владельца ─────────────────────────────────────────
 async def cmd_start(event):
     try:
         await safe_send(event.chat_id,
@@ -209,9 +215,9 @@ async def cmd_start(event):
             "Пытаюсь зайти в закрытые чаты.\n\n"
             "Команды:\n"
             "/stats — статистика\n"
-            "/add <username> — добавить канал\n"
+            "/add &lt;username&gt; — добавить канал\n"
             "/queue — очередь каналов\n"
-            "/search <слова> — поиск\n"
+            "/search &lt;слова&gt; — поиск\n"
             "/export — скачать всё\n"
             "/set_output — назначить этот чат для вывода\n"
             "/pause — пауза\n"
@@ -219,7 +225,6 @@ async def cmd_start(event):
     except Exception as e:
         log.exception("cmd_start: %s", e)
 
-@client.on(events.NewMessage(pattern=r"^/stats$"))
 async def cmd_stats(event):
     try:
         if not is_owner(event): return
@@ -239,7 +244,6 @@ async def cmd_stats(event):
     except Exception as e:
         log.exception("cmd_stats: %s", e)
 
-@client.on(events.NewMessage(pattern=r"^/add (.+)"))
 async def cmd_add(event):
     try:
         if not is_owner(event): return
@@ -269,7 +273,6 @@ async def cmd_add(event):
     except Exception as e:
         log.exception("cmd_add: %s", e)
 
-@client.on(events.NewMessage(pattern=r"^/queue$"))
 async def cmd_queue(event):
     try:
         if not is_owner(event): return
@@ -284,7 +287,6 @@ async def cmd_queue(event):
     except Exception as e:
         log.exception("cmd_queue: %s", e)
 
-@client.on(events.NewMessage(pattern=r"^/search (.+)"))
 async def cmd_search(event):
     try:
         if not is_owner(event): return
@@ -299,7 +301,6 @@ async def cmd_search(event):
     except Exception as e:
         log.exception("cmd_search: %s", e)
 
-@client.on(events.NewMessage(pattern=r"^/export$"))
 async def cmd_export(event):
     try:
         if not is_owner(event): return
@@ -316,7 +317,6 @@ async def cmd_export(event):
     except Exception as e:
         log.exception("cmd_export: %s", e)
 
-@client.on(events.NewMessage(pattern=r"^/set_output$"))
 async def cmd_set_output(event):
     try:
         if not is_owner(event): return
@@ -329,7 +329,6 @@ async def cmd_set_output(event):
     except Exception as e:
         log.exception("cmd_set_output: %s", e)
 
-@client.on(events.NewMessage(pattern=r"^/pause$"))
 async def cmd_pause(event):
     try:
         if not is_owner(event): return
@@ -338,7 +337,6 @@ async def cmd_pause(event):
     except Exception as e:
         log.exception("cmd_pause: %s", e)
 
-@client.on(events.NewMessage(pattern=r"^/resume$"))
 async def cmd_resume(event):
     try:
         if not is_owner(event): return
@@ -346,6 +344,29 @@ async def cmd_resume(event):
         await safe_send(event.chat_id, "▶️ Продолжаем.")
     except Exception as e:
         log.exception("cmd_resume: %s", e)
+
+# ─── Регистрация всех хендлеров ПОСЛЕ старта клиента ──────────────
+def register_handlers():
+    """Добавляем обработчики событий через add_event_handler (не декораторы)"""
+    # Общий обработчик сообщений
+    client.add_event_handler(on_msg, events.NewMessage)
+
+    # ChatAction
+    client.add_event_handler(on_chat_action, events.ChatAction)
+
+    # Команды (порядок важен: более специфичные раньше)
+    client.add_event_handler(cmd_start, events.NewMessage(pattern=r"^/start$"))
+    client.add_event_handler(cmd_add, events.NewMessage(pattern=r"^/add (.+)"))
+    client.add_event_handler(cmd_queue, events.NewMessage(pattern=r"^/queue$"))
+    client.add_event_handler(cmd_stats, events.NewMessage(pattern=r"^/stats$"))
+    client.add_event_handler(cmd_search, events.NewMessage(pattern=r"^/search (.+)"))
+    client.add_event_handler(cmd_export, events.NewMessage(pattern=r"^/export$"))
+    client.add_event_handler(cmd_set_output, events.NewMessage(pattern=r"^/set_output$"))
+    client.add_event_handler(cmd_pause, events.NewMessage(pattern=r"^/pause$"))
+    client.add_event_handler(cmd_resume, events.NewMessage(pattern=r"^/resume$"))
+
+    eb_count = len(client._event_builders) if hasattr(client, '_event_builders') else 0
+    log.info("✅ Зарегистрировано хендлеров: %d", eb_count)
 
 # ─── Сканирование истории канала ─────────────────────────────────────
 async def scrape_channel(username, resume_from=0):
@@ -421,16 +442,19 @@ async def add_seed_channels():
                 log.info("  ➕ @%s — %s", ch, title)
             await asyncio.sleep(2)
         except Exception as e:
-            log.debug("  ❌ @%s: %s", ch, e)
+            log.warning("  ⚠️ @%s: %s", ch, e)  # warning, not debug, чтобы видеть
     log.info("📡 Добавлено %d начальных каналов", added)
 
 # ─── Главный запуск ──────────────────────────────────────────────────
 async def main():
-    # Запускаем health‑сервер ДО client.start(), чтобы Render не убил контейнер
+    # Здоровье ДО старта клиента
     if IS_RENDER:
         asyncio.create_task(health_server())
 
     await client.start(bot_token=BOT_TOKEN)
+    # Регистрируем хендлеры ПОСЛЕ старта
+    register_handlers()
+
     me = await client.get_me()
     log.info("=" * 50)
     log.info("🤖 @%s запущен", me.username or "?")
@@ -441,8 +465,9 @@ async def main():
         log.info("🖥 Локальный режим")
     log.info("=" * 50)
 
+    # Фоновые задачи
+    asyncio.create_task(heartbeat())
     asyncio.create_task(queue_worker())
-
     total_q = conn.execute("SELECT COUNT(*) FROM scrape_queue").fetchone()[0]
     if total_q == 0:
         asyncio.create_task(add_seed_channels())
