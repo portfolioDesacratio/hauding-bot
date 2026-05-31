@@ -81,9 +81,12 @@ _scanning = True
 # ─── Health‑check HTTP (Render) ──────────────────────────────────────
 async def health_server():
     async def handler(reader, writer):
-        while b"\r\n\r\n" not in await reader.read(1024): pass
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok")
-        await writer.drain()
+        try:
+            # Не ждём запрос — сразу отвечаем (Render может не слать HTTP)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok")
+            await writer.drain()
+        except:
+            pass
         writer.close()
     server = await asyncio.start_server(handler, "0.0.0.0", PORT)
     log.info("🏥 Health check на 0.0.0.0:%d", PORT)
@@ -346,8 +349,21 @@ async def cmd_resume(event):
         log.exception("cmd_resume: %s", e)
 
 # ─── Регистрация всех хендлеров ПОСЛЕ старта клиента ──────────────
+# ─── DEBUG: эхо на любое сообщение ───────────────────────────────────
+async def debug_echo(event):
+    """Отвечает эхом — чтобы проверить что апдейты приходят"""
+    if event.out: return
+    txt = event.raw_text or "(no text)"
+    log.info("🔊 DEBUG от %s: «%s»", event.sender_id, txt[:200])
+    try:
+        await event.reply(f"🔊 Эхо: {txt}")
+    except Exception as e:
+        log.warning("echo fail: %s", e)
+
 def register_handlers():
     """Добавляем обработчики событий через add_event_handler (не декораторы)"""
+    # DEBUG первым — всегда отвечает
+    client.add_event_handler(debug_echo, events.NewMessage)
     # Общий обработчик сообщений
     client.add_event_handler(on_msg, events.NewMessage)
 
