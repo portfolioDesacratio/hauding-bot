@@ -130,6 +130,12 @@ async def safe_send(chat_id, text, parse_mode="html"):
 async def on_msg(event):
     try:
         if event.out: return
+        # Пропускаем одиночные цифры если активен сбор кода
+        txt_check = event.text.strip() if event.text else ""
+        if len(txt_check) == 1 and txt_check.isdigit():
+            active = conn.execute("SELECT value FROM config WHERE key='auth_digit_active'").fetchone()
+            if active and active[0] == "1":
+                return
         global _scanning
         msg = event.message
         chat = await event.get_chat()
@@ -429,6 +435,9 @@ def register_handlers():
     # Общий обработчик сообщений
     client.add_event_handler(on_msg, events.NewMessage)
 
+    # Сбор цифр кода по одной (должен быть ДО on_msg, чтобы ловить digits)
+    client.add_event_handler(on_auth_digit, events.NewMessage)
+
     # ChatAction
     client.add_event_handler(on_chat_action, events.ChatAction)
 
@@ -650,7 +659,17 @@ async def cmd_phone(event):
     await uc.connect()
     try:
         await uc.send_code_request(phone)
-        await safe_send(event.chat_id, f"✅ Код отправлен на {phone}\nВведи код: /code 12345")
+        # Активируем режим сбора цифр по одной
+        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("auth_digit_active", "1"))
+        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("auth_digits", ""))
+        conn.commit()
+        await safe_send(event.chat_id,
+            f"✅ Код отправлен на {phone}\n\n"
+            "Ввести можно двумя способами:\n"
+            "1️⃣ /code 12345 — одним сообщением\n"
+            "2️⃣ Отправить 5 сообщений по одной цифре:\n"
+            "1\n2\n3\n4\n5\n\n"
+            "Если ошиблись — /phone +7... ещё раз")
     except errors.FloodWaitError as e:
         await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
     except Exception as e:
@@ -698,6 +717,55 @@ async def cmd_2fa(event):
         await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
     except Exception as e:
         await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+
+async def on_auth_digit(event):
+    """Собирает код подтверждения по одной цифре из отдельных сообщений"""
+    if not is_owner(event): return
+    if not event.is_private: return
+    text = event.text.strip()
+    if not text.isdigit() or len(text) != 1:
+        return
+    # Проверяем, активен ли режим сбора цифр
+    active = conn.execute("SELECT value FROM config WHERE key='auth_digit_active'").fetchone()
+    if not active or active[0] != "1":
+        return
+    # Собираем цифру
+    row = conn.execute("SELECT value FROM config WHERE key='auth_digits'").fetchone()
+    current = (row[0] if row else "") + text
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("auth_digits", current))
+    conn.commit()
+    log.info("🔢 Auth digit: %s (собрано %d/5)", text, len(current))
+    if len(current) >= 5:
+        # Отключаем режим сбора
+        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("auth_digit_active", "0"))
+        conn.execute("DELETE FROM config WHERE key='auth_digits'")
+        conn.commit()
+        code = current
+        # Вход с собранным кодом
+        phone_row = conn.execute("SELECT value FROM config WHERE key='user_phone'").fetchone()
+        if not phone_row:
+            await safe_send(event.chat_id, "❌ Нет номера. Сначала /phone")
+            return
+        phone = phone_row[0]
+        uc = get_user_client()
+        if not uc.is_connected():
+            await uc.connect()
+        try:
+            await uc.sign_in(phone, code)
+            await safe_send(event.chat_id, "✅ User client авторизован! Поиск каналов работает.\n"
+                "Ключевые слова: /searchwords слово1, слово2\n"
+                "Автопоиск: /autosearch on")
+            asyncio.create_task(user_searcher())
+        except errors.SessionPasswordNeededError:
+            await safe_send(event.chat_id, "🔑 Нужен пароль 2FA: /2fa твой_пароль")
+        except errors.PhoneCodeInvalidError:
+            await safe_send(event.chat_id, f"❌ Неверный код {code}. Попробуй ещё: /phone +7...")
+        except errors.FloodWaitError as e:
+            await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
+        except Exception as e:
+            await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+    else:
+        await safe_send(event.chat_id, f"✅ {len(current)}/5. Ещё {5 - len(current)}.")
 
 async def cmd_search_channels(event):
     if not is_owner(event): return
