@@ -242,8 +242,8 @@ async def backup_settings_to_telegram():
     except Exception as e:
         log.warning("backup_settings_to_telegram: %s", e)
 
-async def _find_backup_in_chat(chat_id):
-    """Ищет бэкап среди последних 50 сообщений в чате"""
+async def _find_backup_in_chat(chat_id, uc):
+    """Ищет бэкап среди последних 50 сообщений в чате (через user-клиент)"""
     try:
         msg_id_key = f"backup_msg_id_{chat_id}"
         old_id = conn.execute("SELECT value FROM config WHERE key=?", (msg_id_key,)).fetchone()
@@ -251,14 +251,14 @@ async def _find_backup_in_chat(chat_id):
         # Сначала пробуем по сохранённому msg_id (если БД не сброшена)
         if old_id:
             try:
-                msg = await client.get_messages(chat_id, ids=int(old_id[0]))
+                msg = await uc.get_messages(chat_id, ids=int(old_id[0]))
                 if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Exstrorezov"):
                     return msg.text
             except Exception:
                 pass
         
-        # Иначе листаем последние сообщения (бот-админ может читать историю канала)
-        async for msg in client.iter_messages(chat_id, limit=50):
+        # Иначе листаем последние сообщения (user-клиент может читать историю)
+        async for msg in uc.iter_messages(chat_id, limit=50):
             if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Exstrorezov"):
                 # Обновляем msg_id в БД для будущих обновлений
                 conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (msg_id_key, str(msg.id)))
@@ -269,23 +269,27 @@ async def _find_backup_in_chat(chat_id):
     return None
 
 async def restore_settings_from_backup():
-    """Восстанавливает настройки из бэкапа в канале вывода (бот админ — может читать)"""
+    """Восстанавливает настройки из бэкапа в канале вывода (через user-клиент)"""
     log.info("📦 Ищу бэкап для восстановления настроек...")
     
-    # Пробуем найти бэкап в канале вывода (если назначен) или в заданном канале по умолчанию
+    uc = get_user_client()
+    if not uc or not uc.is_connected():
+        log.warning("📦 User-клиент не подключён — восстановление невозможно")
+        return False
+    
+    # Пробуем найти бэкап в канале вывода (или в FALLBACK_OUTPUT_CHAT)
     target = get_output_chat() or FALLBACK_OUTPUT_CHAT
     if target:
-        backup_text = await _find_backup_in_chat(target)
+        backup_text = await _find_backup_in_chat(target, uc)
         if backup_text and _parse_backup_lines(backup_text):
             log.info("📦 Настройки восстановлены из бэкапа в канале %s", target)
             return True
     
-    # Если в канале не нашли, пробуем в личке владельца (на случай если канал недоступен)
+    # Если в канале не нашли, пробуем в личке владельца
     log.info("📦 Бэкап в канале не найден, ищу в личке владельца...")
     try:
-        async for msg in client.iter_messages(OWNER_ID, limit=50):
+        async for msg in uc.iter_messages(OWNER_ID, limit=50):
             if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Exstrorezov"):
-                # Сохраняем msg_id для будущих обновлений
                 conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
                 conn.commit()
                 if _parse_backup_lines(msg.text):
@@ -1708,7 +1712,18 @@ async def main():
         log.info("🖥 Локальный режим")
     log.info("=" * 50)
 
-    # Восстанавливаем настройки из бэкапа Telegram, если локально ничего нет
+    # Фоновые задачи (кроме queue_worker — он позже)
+    asyncio.create_task(heartbeat())
+    asyncio.create_task(self_pinger())
+    
+    # 1. Подключаем user-клиент (нужен для чтения каналов и бэкапа)
+    user_ok = await init_user_client()
+    if user_ok:
+        log.info("👤 User-клиент готов")
+    else:
+        log.warning("👤 User-клиент НЕ готов — каналы не будут читаться до /auth")
+    
+    # 2. Восстанавливаем настройки из бэкапа (через user-клиент)
     texts_count = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
     if texts_count == 0 and not get_output_chat():
         log.info("📦 База пуста, пробую восстановить из бэкапа Telegram...")
@@ -1717,8 +1732,13 @@ async def main():
             log.info("📦 Настройки восстановлены из бэкапа!")
         else:
             log.info("📦 Бэкап не найден, всё придётся настроить заново")
-
-    # Восстанавливаем настройки и шлём уведомление владельцу
+    
+    # 3. Seed-каналы добавляем всегда (INSERT OR IGNORE — дубликаты безопасны)
+    await add_seed_channels()
+    # Persistent-каналы добавляем в любом случае
+    await add_persistent_to_queue()
+    
+    # 4. Шлём уведомление владельцу с актуальным состоянием
     restored_settings = []
     out_ch = get_output_chat()
     if out_ch: restored_settings.append(f"📤 Канал вывода: {out_ch}")
@@ -1735,16 +1755,9 @@ async def main():
         await client.send_message(OWNER_ID, startup_msg, parse_mode="html")
     except:
         pass
-
-    # Фоновые задачи
-    asyncio.create_task(heartbeat())
-    asyncio.create_task(self_pinger())
+    
+    # 5. Queue worker запускаем ПОСЛЕ того, как всё готово
     asyncio.create_task(queue_worker())
-    asyncio.create_task(init_user_client())
-    # Seed-каналы добавляем всегда (INSERT OR IGNORE — дубликаты безопасны)
-    await add_seed_channels()
-    # Persistent-каналы добавляем в любом случае (они могли не успеть добавиться при seed)
-    asyncio.create_task(add_persistent_to_queue())
 
     await client.run_until_disconnected()
 
