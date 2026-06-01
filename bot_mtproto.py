@@ -1115,9 +1115,10 @@ async def scrape_channel(username, resume_from=0, retries=0):
     return saved
 
 async def queue_worker():
-    """Постоянно сканирует ВСЕ каналы одновременно"""
+    """Постоянно сканирует каналы с ограничением конкурентности"""
     active_tasks = {}  # username -> task
-    log.info("🚀 Queue worker запущен — обрабатываю все каналы сразу")
+    MAX_CONCURRENT = 10  # не больше 10 каналов одновременно
+    log.info("🚀 Queue worker запущен — макс %d каналов одновременно", MAX_CONCURRENT)
 
     async def run_scrape(username, last_msg_id):
         """Обёртка для scrape_channel с таймаутом"""
@@ -1153,11 +1154,13 @@ async def queue_worker():
             del active_tasks[u]
 
         try:
-            # Запускаем ВСЕ pending-каналы, которых ещё нет в active_tasks
+            # Запускаем pending-каналы с учётом лимита конкурентности
             rows = conn.execute(
                 "SELECT username,last_msg_id FROM scrape_queue WHERE status='pending' ORDER BY added_at"
             ).fetchall()
             for row in rows:
+                slots = MAX_CONCURRENT - len(active_tasks)
+                if slots <= 0: break
                 if row[0] not in active_tasks:
                     task = asyncio.create_task(run_scrape(row[0], row[1]))
                     active_tasks[row[0]] = task
@@ -1735,6 +1738,13 @@ async def main():
     
     # 3. Seed-каналы добавляем всегда (INSERT OR IGNORE — дубликаты безопасны)
     await add_seed_channels()
+    # Сбрасываем error-каналы обратно в pending (чтобы перезапустились с новым лимитом)
+    reset = conn.execute(
+        "UPDATE scrape_queue SET status='pending', error=NULL WHERE status='error'"
+    ).rowcount
+    if reset:
+        conn.commit()
+        log.info("🔄 Сброшено %d error-каналов в pending", reset)
     # Persistent-каналы добавляем в любом случае
     await add_persistent_to_queue()
     
