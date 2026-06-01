@@ -2,7 +2,7 @@
 """Exstrorezov Collector — Telegram Collector (MTProto/Telethon)
    Читает публичные каналы без вступления.
    Собирает тексты ≥50 слов и отправляет в назначенный канал."""
-import asyncio, logging, os, re, sqlite3, sys, hashlib
+import asyncio, logging, os, re, sqlite3, sys, hashlib, time
 from datetime import datetime
 from pathlib import Path
 from telethon import TelegramClient, errors, events, functions
@@ -1014,6 +1014,22 @@ def register_handlers():
     eb_count = len(client._event_builders) if hasattr(client, '_event_builders') else 0
     log.info("✅ Зарегистрировано хендлеров: %d", eb_count)
 
+# ─── Rate limiter для get_entity (чтобы избежать FloodWait при массовом старте) ──
+_entity_last_call = 0.0
+_entity_lock = asyncio.Lock()
+
+async def _rate_limited_get_entity(reader, username):
+    """Вызывает reader.get_entity(username) с паузой min 300мс между вызовами"""
+    global _entity_last_call
+    async with _entity_lock:
+        now = time.monotonic()
+        since_last = now - _entity_last_call
+        if since_last < 0.3:
+            await asyncio.sleep(0.3 - since_last)
+        entity = await reader.get_entity(username)
+        _entity_last_call = time.monotonic()
+        return entity
+
 # ─── Сканирование истории канала ─────────────────────────────────────
 # Использует user-клиент (твой аккаунт) для чтения, бот-клиент только для управления
 async def get_reader():
@@ -1042,7 +1058,7 @@ async def scrape_channel(username, resume_from=0, retries=0):
         log.warning("⚠️ @%s: нет user-клиента, бот не может читать", username)
         return -1
     try:
-        entity = await reader.get_entity(username)
+        entity = await _rate_limited_get_entity(reader, username)
     except errors.UsernameNotOccupiedError:
         conn.execute("UPDATE scrape_queue SET status='error',error='Username not found' WHERE username=?", (username,))
         conn.commit()
@@ -1117,7 +1133,7 @@ async def scrape_channel(username, resume_from=0, retries=0):
 async def queue_worker():
     """Постоянно сканирует каналы с ограничением конкурентности"""
     active_tasks = {}  # username -> task
-    MAX_CONCURRENT = 10  # не больше 10 каналов одновременно
+    MAX_CONCURRENT = 999  # без лимита — все каналы сразу, rate limit только на get_entity
     log.info("🚀 Queue worker запущен — макс %d каналов одновременно", MAX_CONCURRENT)
 
     async def run_scrape(username, last_msg_id):
