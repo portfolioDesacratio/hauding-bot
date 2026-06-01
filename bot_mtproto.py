@@ -542,7 +542,7 @@ async def on_msg(event):
                 text_content = fb.decode("utf-8", errors="replace")
                 
                 # Если файл прислал владелец в ЛС — broadcast частями
-                if event.is_private and event.sender_id == OWNER_ID:
+                if event.is_private and is_owner(event):
                     await broadcast_file(text_content, fn, event)
                 else:
                     # Старое поведение: абзацы в базу
@@ -552,7 +552,7 @@ async def on_msg(event):
                                 await send_to_output(b.strip(), title, f"file:{fn}")
             except Exception as e:
                 log.error("Файл: %s", e)
-                if event.is_private and event.sender_id == OWNER_ID:
+                if event.is_private and is_owner(event):
                     await safe_send(event.chat_id, f"❌ Ошибка при обработке файла: {str(e)[:200]}")
     except Exception as e:
         log.exception("❌ on_msg: %s", e)

@@ -142,7 +142,7 @@ _scanning = True
 
 # ─── Бэкап настроек в Telegram (чтобы не слетало после редеплоя) ──
 BACKUP_MSG_ID_KEY = "backup_msg_id"
-FALLBACK_OUTPUT_CHAT = 0  # друг назначит сам через /set_output
+FALLBACK_OUTPUT_CHAT = -1003862496471  # канал "архив" друга
 
 def _build_backup_text():
     """Собирает текст бэкапа из текущих настроек в БД"""
@@ -231,7 +231,7 @@ async def backup_settings_to_telegram():
             log.warning("Не удалось отправить бэкап владельцу: %s", e)
         
         # 2. Сохраняем в канал вывода (бот админ → может читать при восстановлении)
-        target = get_output_chat() or None
+        target = get_output_chat() or FALLBACK_OUTPUT_CHAT
         if target:
             try:
                 await _save_backup_to_chat(target, backup_text)
@@ -272,8 +272,8 @@ async def restore_settings_from_backup():
     """Восстанавливает настройки из бэкапа в канале вывода (бот админ — может читать)"""
     log.info("📦 Ищу бэкап для восстановления настроек...")
     
-    # Пробуем найти бэкап в канале вывода (если назначен)
-    target = get_output_chat()
+    # Пробуем найти бэкап в канале вывода (если назначен) или в заданном канале по умолчанию
+    target = get_output_chat() or FALLBACK_OUTPUT_CHAT
     if target:
         backup_text = await _find_backup_in_chat(target)
         if backup_text and _parse_backup_lines(backup_text):
@@ -542,7 +542,7 @@ async def on_msg(event):
                 text_content = fb.decode("utf-8", errors="replace")
                 
                 # Если файл прислал владелец в ЛС — broadcast частями
-                if event.is_private and event.sender_id == OWNER_ID:
+                if event.is_private and is_owner(event):
                     await broadcast_file(text_content, fn, event)
                 else:
                     # Старое поведение: абзацы в базу
@@ -552,7 +552,7 @@ async def on_msg(event):
                                 await send_to_output(b.strip(), title, f"file:{fn}")
             except Exception as e:
                 log.error("Файл: %s", e)
-                if event.is_private and event.sender_id == OWNER_ID:
+                if event.is_private and is_owner(event):
                     await safe_send(event.chat_id, f"❌ Ошибка при обработке файла: {str(e)[:200]}")
     except Exception as e:
         log.exception("❌ on_msg: %s", e)
