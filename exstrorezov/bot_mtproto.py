@@ -24,12 +24,11 @@ if env_path.exists():
 
 # Snap-credentials от Telegram Desktop (публичные, используются всеми Linux-дистрибутивами)
 # Отдельный API_ID = отдельный FloodWait counter — больше никогда не будет блокировки номера
-DEFAULT_API_ID = 611335
-DEFAULT_API_HASH = "d524b414d21f4d37f08684c1df41ac9c"
-API_ID = int(os.getenv("API_ID", DEFAULT_API_ID))
-API_HASH = os.getenv("API_HASH", DEFAULT_API_HASH)
+# ⚠️ НЕ читаем из Render env — старые переменные в Dashboard будут игнорироваться
+API_ID = 611335
+API_HASH = "d524b414d21f4d37f08684c1df41ac9c"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-if not all([API_ID, API_HASH, BOT_TOKEN]):
+if not BOT_TOKEN:
     log.error("Задай BOT_TOKEN в .env"); sys.exit(1)
 
 OWNER_IDS = {8587090554, 895508019}  # я + друг
