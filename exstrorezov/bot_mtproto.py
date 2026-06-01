@@ -1010,6 +1010,7 @@ def register_handlers():
     client.add_event_handler(cmd_searchwords, events.NewMessage(pattern=r"^/searchwords?\s+(.+)"))
     # Удалить user_client + отвязать (если нужно переавторизоваться)
     client.add_event_handler(cmd_logout_user, events.NewMessage(pattern=r"^/logout_user$"))
+    client.add_event_handler(cmd_export_session, events.NewMessage(pattern=r"^/export_session$"))
 
     eb_count = len(client._event_builders) if hasattr(client, '_event_builders') else 0
     log.info("✅ Зарегистрировано хендлеров: %d", eb_count)
@@ -1336,7 +1337,14 @@ user_client = None
 def get_user_client():
     global user_client
     if user_client is None:
-        user_client = TelegramClient(USER_SESSION, API_ID, API_HASH)
+        from telethon.sessions import StringSession
+        session_string = os.getenv("USER_SESSION_STRING") or ""
+        if session_string.strip():
+            log.info("🔑 Использую USER_SESSION_STRING из env")
+            session = StringSession(session_string.strip())
+        else:
+            session = USER_SESSION  # файл (не survives redeploy на Free)
+        user_client = TelegramClient(session, API_ID, API_HASH)
     return user_client
 
 async def init_user_client():
@@ -1450,7 +1458,9 @@ async def cmd_code(event):
         await uc.sign_in(phone, code)
         await safe_send(event.chat_id, "✅ User client авторизован! Поиск каналов работает.\n"
             "Поставь ключевые слова: /searchwords слово1, слово2\n"
-            "Включи автопоиск: /autosearch on")
+            "Включи автопоиск: /autosearch on\n\n"
+            "💡 <b>Чтобы сессия не сбрасывалась при редеплое:</b>\n"
+            "/export_session — скопируй строку и добавь в Render Environment")
         asyncio.create_task(user_searcher())
         _requeue_bot_errors()
     except errors.SessionPasswordNeededError:
@@ -1472,7 +1482,9 @@ async def cmd_2fa(event):
         await uc.sign_in(password=password)
         await safe_send(event.chat_id, "✅ User client авторизован (2FA)! Поиск работает.\n"
             "Ключевые слова: /searchwords слово1, слово2\n"
-            "Автопоиск: /autosearch on")
+            "Автопоиск: /autosearch on\n\n"
+            "💡 <b>Чтобы сессия не сбрасывалась при редеплое:</b>\n"
+            "/export_session — скопируй строку и добавь в Render Environment")
         asyncio.create_task(user_searcher())
         _requeue_bot_errors()
     except errors.FloodWaitError as e:
@@ -1516,7 +1528,9 @@ async def on_auth_digit(event):
             await uc.sign_in(phone, code)
             await safe_send(event.chat_id, "✅ User client авторизован! Поиск каналов работает.\n"
                 "Ключевые слова: /searchwords слово1, слово2\n"
-                "Автопоиск: /autosearch on")
+                "Автопоиск: /autosearch on\n\n"
+                "💡 <b>Чтобы сессия не сбрасывалась при редеплое:</b>\n"
+                "/export_session — скопируй строку и добавь в Render Environment")
             asyncio.create_task(user_searcher())
             _requeue_bot_errors()
         except errors.SessionPasswordNeededError:
@@ -1699,6 +1713,27 @@ async def cmd_logout_user(event):
     conn.execute("DELETE FROM config WHERE key='user_phone'")
     conn.commit()
     await safe_send(event.chat_id, "✅ User client отвязан. Сессия удалена.")
+
+async def cmd_export_session(event):
+    """Экспортирует session string для сохранения в Render env"""
+    if not is_owner(event): return
+    uc = get_user_client()
+    try:
+        if await uc.is_user_authorized() and uc.is_connected():
+            from telethon.sessions import StringSession
+            s = StringSession.save(uc.session)
+            await safe_send(event.chat_id,
+                f"🔑 <b>Session string для Render env:</b>\n\n"
+                f"<code>{s}</code>\n\n"
+                f"1. Скопируй строку выше\n"
+                f"2. Render Dashboard → exstrorezov-bot → Environment → добавить:\n"
+                f"   <b>USER_SESSION_STRING</b> = вставленная строка\n"
+                f"3. Redeploy\n\n"
+                f"После этого сессия будет сохраняться между деплоями.")
+        else:
+            await safe_send(event.chat_id, "❌ User client не авторизован.\nСначала сделай /auth → /phone → /code")
+    except Exception as e:
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
 
 # ─── Главный запуск ──────────────────────────────────────────────────
 async def main():
