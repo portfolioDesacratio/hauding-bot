@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from telethon import TelegramClient, errors, events, functions
 
-MAX_TEXT_DUPLICATES = 3  # сколько раз можно сохранить один и тот же текст
+MAX_TEXT_DUPLICATES = 2  # макс повторов одного текста — при 3м разе блокируется навсегда
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
@@ -22,13 +22,18 @@ if env_path.exists():
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
 
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH", "")
+# Snap-credentials от Telegram Desktop (публичные, используются всеми Linux-дистрибутивами)
+# Отдельный API_ID = отдельный FloodWait counter — больше никогда не будет блокировки номера
+DEFAULT_API_ID = 611335
+DEFAULT_API_HASH = "d524b414d21f4d37f08684c1df41ac9c"
+API_ID = int(os.getenv("API_ID", DEFAULT_API_ID))
+API_HASH = os.getenv("API_HASH", DEFAULT_API_HASH)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-API_ID = int(os.getenv("API_ID", 0))
-API_HASH = os.getenv("API_HASH", "")
+if not all([API_ID, API_HASH, BOT_TOKEN]):
+    log.error("Задай BOT_TOKEN в .env"); sys.exit(1)
+
 OWNER_IDS = {8587090554, 895508019}  # я + друг
-OWNER_ID = 895508019  # друг (для уведомлений)
+OWNER_ID = 895508019  # (для уведомлений)
 
 IS_RENDER = os.getenv("RENDER") == "true"
 RENDER_URL = os.getenv("RENDER_URL") or os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
@@ -55,7 +60,7 @@ conn.execute("""CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
 # Таблица для подсчёта дубликатов текстов (ключ — sha256 content)
 conn.execute("""CREATE TABLE IF NOT EXISTS text_hashes (
-    hash TEXT PRIMARY KEY, count INTEGER DEFAULT 1)""")
+    hash TEXT PRIMARY KEY, count INTEGER DEFAULT 1, banned INTEGER DEFAULT 0)""")
 conn.commit()
 
 def wc(text): return len(text.split())
@@ -116,11 +121,18 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
         return False
     
     # Дедупликация: одинаковый текст сохраняем максимум MAX_TEXT_DUPLICATES раз
+    # На 3й раз текст БЛОКИРУЕТСЯ навсегда — banned=1, никогда не пройдёт
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    row = conn.execute("SELECT count FROM text_hashes WHERE hash=?", (content_hash,)).fetchone()
+    row = conn.execute("SELECT count, banned FROM text_hashes WHERE hash=?", (content_hash,)).fetchone()
     if row:
+        if row[1] == 1:
+            log.debug("⏭️ Дубликат ЗАБАНЕН: %d слов из %s", wc(content), chat_title)
+            return False
         if row[0] >= MAX_TEXT_DUPLICATES:
-            log.debug("⏭️ Дубликат #%d (макс %d): %d слов из %s", row[0] + 1, MAX_TEXT_DUPLICATES, wc(content), chat_title)
+            # Третий раз — бан навсегда
+            conn.execute("UPDATE text_hashes SET banned=1 WHERE hash=?", (content_hash,))
+            conn.commit()
+            log.warning("🚫 Текст ЗАБАНЕН (3й дубликат): %d слов из %s", wc(content), chat_title)
             return False
         conn.execute("UPDATE text_hashes SET count=count+1 WHERE hash=?", (content_hash,))
         dup_num = row[0] + 1
@@ -142,7 +154,7 @@ _scanning = True
 
 # ─── Бэкап настроек в Telegram (чтобы не слетало после редеплоя) ──
 BACKUP_MSG_ID_KEY = "backup_msg_id"
-FALLBACK_OUTPUT_CHAT = -1003862496471  # канал "архив" друга
+FALLBACK_OUTPUT_CHAT = -1003862496471  # канал вывода (постоянный, бот там админ)
 
 def _build_backup_text():
     """Собирает текст бэкапа из текущих настроек в БД"""
@@ -150,10 +162,12 @@ def _build_backup_text():
     kw = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
     phone = conn.execute("SELECT value FROM config WHERE key='user_phone'").fetchone()
     auto = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
+    ss = conn.execute("SELECT value FROM config WHERE key='user_session_string'").fetchone()
     lines = ["📦 Бэкап настроек Exstrorezov"]
     if out: lines.append(f"output_chat={out}")
     if kw: lines.append(f"searchwords={kw[0]}")
     if phone: lines.append(f"phone={phone[0]}")
+    if ss and ss[0].strip(): lines.append(f"session_string={ss[0]}")
     if auto: lines.append(f"autosearch={auto[0]}")
     pers = get_persistent_channels()
     if pers: lines.append(f"persistent={','.join(pers)}")
@@ -184,6 +198,11 @@ def _parse_backup_lines(text):
             if val:
                 conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_autosearch", val))
                 log.info("📦 Восстановлен автопоиск: %s", val)
+        elif line.startswith("session_string="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_session_string", val))
+                log.info("📦 Восстановлена session_string из бэкапа")
         elif line.startswith("persistent="):
             val = line.split("=", 1)[1].strip()
             if val:
@@ -232,12 +251,11 @@ async def backup_settings_to_telegram():
         
         # 2. Сохраняем в канал вывода (бот админ → может читать при восстановлении)
         target = get_output_chat() or FALLBACK_OUTPUT_CHAT
-        if target:
-            try:
-                await _save_backup_to_chat(target, backup_text)
-                log.info("💾 Бэкап сохранён в канал %s", target)
-            except Exception as e:
-                log.warning("Не удалось сохранить бэкап в канал %s: %s", target, e)
+        try:
+            await _save_backup_to_chat(target, backup_text)
+            log.info("💾 Бэкап сохранён в канал %s", target)
+        except Exception as e:
+            log.warning("Не удалось сохранить бэкап в канал %s: %s", target, e)
             
     except Exception as e:
         log.warning("backup_settings_to_telegram: %s", e)
@@ -1011,25 +1029,107 @@ def register_handlers():
     # Удалить user_client + отвязать (если нужно переавторизоваться)
     client.add_event_handler(cmd_logout_user, events.NewMessage(pattern=r"^/logout_user$"))
     client.add_event_handler(cmd_export_session, events.NewMessage(pattern=r"^/export_session$"))
+    client.add_event_handler(cmd_restore_session, events.NewMessage(pattern=r"^/restore_session$"))
 
     eb_count = len(client._event_builders) if hasattr(client, '_event_builders') else 0
     log.info("✅ Зарегистрировано хендлеров: %d", eb_count)
 
-# ─── Rate limiter для get_entity (чтобы избежать FloodWait при массовом старте) ──
+# ─── Универсальная защита от FloodWait ──────────────────────────────
+# Глобальные счётчики вызовов API для каждого клиента
+_api_call_times = {}  # id(client) -> [timestamp, ...]
+_api_lock = asyncio.Lock()
+MAX_API_CALLS_PER_SEC = 3  # макс 3 API-вызова в секунду на клиент
+
+async def safe_api_call(client_obj, method_name, *args, min_delay=0.35, **kwargs):
+    """
+    Безопасный вызов любого метода Telethon с:
+    - rate limiting (мин 350мс между вызовами на клиент)
+    - автоматическим ожиданием FloodWait + exponential backoff
+    - повторными попытками
+    """
+    client_id = id(client_obj)
+    max_retries = 5
+    
+    for attempt in range(max_retries + 1):
+        # Rate limit: ждём min_delay с последнего вызова
+        async with _api_lock:
+            now = time.monotonic()
+            last_times = _api_call_times.get(client_id, [])
+            # Очищаем вызовы старше 1с
+            last_times = [t for t in last_times if now - t < 1.0]
+            if last_times:
+                time_since_last = now - last_times[-1]
+                if time_since_last < min_delay:
+                    await asyncio.sleep(min_delay - time_since_last)
+                    now = time.monotonic()
+            last_times.append(now)
+            _api_call_times[client_id] = last_times
+        
+        try:
+            method = getattr(client_obj, method_name)
+            result = await method(*args, **kwargs)
+            return result
+        except errors.FloodWaitError as e:
+            wait_time = min(e.seconds, 600)  # макс 10 минут ожидания
+            # Exponential backoff: каждый повтор ждём дольше
+            wait_with_backoff = wait_time * (2 ** attempt)
+            wait_with_backoff = min(wait_with_backoff, 3600)  # макс 1 час
+            log.warning("⏳ FloodWait %ds на %s (попытка %d/%d, жду %ds)",
+                       e.seconds, method_name, attempt + 1, max_retries + 1, wait_with_backoff)
+            await asyncio.sleep(wait_with_backoff)
+            if attempt >= max_retries:
+                log.error("❌ Слишком много FloodWait на %s, пропускаю", method_name)
+                raise
+        except errors.ServerError as e:
+            log.warning("⚠️ ServerError на %s: %s (жду 5с, попытка %d/%d)",
+                       method_name, e, attempt + 1, max_retries + 1)
+            await asyncio.sleep(5)
+            if attempt >= max_retries:
+                raise
+        except errors.RPCError as e:
+            if "FLOOD" in str(e).upper():
+                log.warning("⏳ Flood (RPC) на %s: %s (жду 30с)", method_name, e)
+                await asyncio.sleep(30)
+                continue
+            raise
+    
+    raise RuntimeError(f"safe_api_call: все попытки исчерпаны для {method_name}")
+
+async def safe_get_entity(client_obj, identifier):
+    """get_entity с защитой от FloodWait"""
+    return await safe_api_call(client_obj, "get_entity", identifier, min_delay=0.35)
+
+async def safe_send_message(client_obj, *args, **kwargs):
+    """send_message с защитой от FloodWait"""
+    return await safe_api_call(client_obj, "send_message", *args, min_delay=0.5, **kwargs)
+
+async def safe_get_messages(client_obj, *args, **kwargs):
+    """get_messages с защитой от FloodWait"""
+    return await safe_api_call(client_obj, "get_messages", *args, min_delay=0.3, **kwargs)
+
+# Rate limiter для итерации сообщений (используется в scrape_channel)
+_msg_iter_lock = asyncio.Lock()
+_msg_iter_last_call = 0.0
+
+async def safe_iter_messages(client_obj, entity, **kwargs):
+    """iter_messages с защитой от FloodWait и паузами между вызовами"""
+    global _msg_iter_last_call
+    async with _msg_iter_lock:
+        now = time.monotonic()
+        since_last = now - _msg_iter_last_call
+        if since_last < 0.5:
+            await asyncio.sleep(0.5 - since_last)
+        result = client_obj.iter_messages(entity, **kwargs)
+        _msg_iter_last_call = time.monotonic()
+        return result
+
+# Старый rate limiter для get_entity (оставляем для обратной совместимости)
 _entity_last_call = 0.0
 _entity_lock = asyncio.Lock()
 
 async def _rate_limited_get_entity(reader, username):
     """Вызывает reader.get_entity(username) с паузой min 300мс между вызовами"""
-    global _entity_last_call
-    async with _entity_lock:
-        now = time.monotonic()
-        since_last = now - _entity_last_call
-        if since_last < 0.3:
-            await asyncio.sleep(0.3 - since_last)
-        entity = await reader.get_entity(username)
-        _entity_last_call = time.monotonic()
-        return entity
+    return await safe_get_entity(reader, username)
 
 # ─── Сканирование истории канала ─────────────────────────────────────
 # Использует user-клиент (твой аккаунт) для чтения, бот-клиент только для управления
@@ -1333,17 +1433,25 @@ async def add_seed_channels():
 # ─── User‑клиент (твой аккаунт) для Search API ───────────────────────
 USER_SESSION = str(DATA_DIR / "user_session")
 user_client = None
+_telethon_ss_imported = False  # ленивый импорт StringSession
 
 def get_user_client():
-    global user_client
+    global user_client, _telethon_ss_imported
     if user_client is None:
         from telethon.sessions import StringSession
+        _telethon_ss_imported = True
         session_string = os.getenv("USER_SESSION_STRING") or ""
         if session_string.strip():
             log.info("🔑 Использую USER_SESSION_STRING из env")
             session = StringSession(session_string.strip())
         else:
-            session = USER_SESSION  # файл (не survives redeploy на Free)
+            # Пробуем из БД (сохраняется через бэкап на Telegram)
+            db_ss = conn.execute("SELECT value FROM config WHERE key='user_session_string'").fetchone()
+            if db_ss and db_ss[0].strip():
+                log.info("🔑 Использую session string из БД (восстановлен из бэкапа)")
+                session = StringSession(db_ss[0].strip())
+            else:
+                session = USER_SESSION  # файл (не survives redeploy на Free)
         user_client = TelegramClient(session, API_ID, API_HASH)
     return user_client
 
@@ -1371,6 +1479,15 @@ async def init_user_client():
         await uc.connect()
         if await uc.is_user_authorized():
             log.info("👤 User client авторизован (сессия сохранена)")
+            # Авто-экспорт session string в БД для надёжности
+            try:
+                from telethon.sessions import StringSession
+                ss = StringSession.save(uc.session)
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                             ("user_session_string", ss))
+                conn.commit()
+            except Exception:
+                pass
             asyncio.create_task(user_searcher())
             # Уведомляем что всё ок
             try:
@@ -1401,6 +1518,26 @@ DEFAULT_SEARCH_KEYWORDS = (
     "легкая кавалерия, шаббат, сраббат, срабат, шабат, шаблоны, шаблон, "
     "сраблон, сраблоны, сраготовки, заготовки"
 )
+
+async def _auto_export_session(notify_chat_id=None):
+    """Автоматически сохраняет session string в бэкап и уведомляет владельца"""
+    try:
+        uc = get_user_client()
+        if await uc.is_user_authorized() and uc.is_connected():
+            from telethon.sessions import StringSession
+            ss = StringSession.save(uc.session)
+            # Сохраняем в БД (переживёт только до редеплоя, но бэкап в Telegram сохранит)
+            conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                         ("user_session_string", ss))
+            conn.commit()
+            # Сохраняем в бэкап Telegram (в канал вывода)
+            asyncio.create_task(backup_settings_to_telegram())
+            log.info("🔑 Session string сохранена в бэкап")
+            if notify_chat_id:
+                from telethon.tl.functions.messages import SetBotPrecheckoutResultsRequest
+                pass
+    except Exception as e:
+        log.warning("auto_export_session: %s", e)
 
 async def cmd_auth(event):
     if not is_owner(event): return
@@ -1456,11 +1593,20 @@ async def cmd_code(event):
         await uc.connect()
     try:
         await uc.sign_in(phone, code)
+        # Авто-экспорт сессии в бэкап
+        await _auto_export_session(event.chat_id)
+        # Восстанавливаем остальные настройки из бэкапа
+        restored = await restore_settings_from_backup()
+        if restored:
+            await safe_send(event.chat_id, "📦 Настройки восстановлены из бэкапа!")
         await safe_send(event.chat_id, "✅ User client авторизован! Поиск каналов работает.\n"
             "Поставь ключевые слова: /searchwords слово1, слово2\n"
             "Включи автопоиск: /autosearch on\n\n"
-            "💡 <b>Чтобы сессия не сбрасывалась при редеплое:</b>\n"
-            "/export_session — скопируй строку и добавь в Render Environment")
+            "💡 <b>Сессия сохранена в бэкап.</b> После редеплоя восстановится автоматически.\n"
+            "Если хочешь сохранить в Render env (надёжнее):\n"
+            "1. /export_session\n"
+            "2. Скопируй строку\n"
+            "3. Добавь USER_SESSION_STRING в Render Dashboard → Environment → Redeploy")
         asyncio.create_task(user_searcher())
         _requeue_bot_errors()
     except errors.SessionPasswordNeededError:
@@ -1480,11 +1626,16 @@ async def cmd_2fa(event):
         await uc.connect()
     try:
         await uc.sign_in(password=password)
+        await _auto_export_session(event.chat_id)
+        restored = await restore_settings_from_backup()
+        if restored:
+            await safe_send(event.chat_id, "📦 Настройки восстановлены из бэкапа!")
         await safe_send(event.chat_id, "✅ User client авторизован (2FA)! Поиск работает.\n"
             "Ключевые слова: /searchwords слово1, слово2\n"
             "Автопоиск: /autosearch on\n\n"
-            "💡 <b>Чтобы сессия не сбрасывалась при редеплое:</b>\n"
-            "/export_session — скопируй строку и добавь в Render Environment")
+            "💡 <b>Сессия сохранена в бэкап.</b> После редеплоя восстановится автоматически.\n"
+            "Если хочешь сохранить в Render env (надёжнее):\n"
+            "1. /export_session  2. Добавь в Render Dashboard → Environment")
         asyncio.create_task(user_searcher())
         _requeue_bot_errors()
     except errors.FloodWaitError as e:
@@ -1526,11 +1677,16 @@ async def on_auth_digit(event):
             await uc.connect()
         try:
             await uc.sign_in(phone, code)
+            await _auto_export_session(event.chat_id)
+            restored = await restore_settings_from_backup()
+            if restored:
+                await safe_send(event.chat_id, "📦 Настройки восстановлены из бэкапа!")
             await safe_send(event.chat_id, "✅ User client авторизован! Поиск каналов работает.\n"
                 "Ключевые слова: /searchwords слово1, слово2\n"
                 "Автопоиск: /autosearch on\n\n"
-                "💡 <b>Чтобы сессия не сбрасывалась при редеплое:</b>\n"
-                "/export_session — скопируй строку и добавь в Render Environment")
+                "💡 <b>Сессия сохранена в бэкап.</b> После редеплоя восстановится автоматически.\n"
+                "Если хочешь сохранить в Render env (надёжнее):\n"
+                "1. /export_session  2. Добавь в Render Dashboard → Environment")
             asyncio.create_task(user_searcher())
             _requeue_bot_errors()
         except errors.SessionPasswordNeededError:
@@ -1726,12 +1882,39 @@ async def cmd_export_session(event):
                 f"🔑 <b>Session string для Render env:</b>\n\n"
                 f"<code>{s}</code>\n\n"
                 f"1. Скопируй строку выше\n"
-                f"2. Render Dashboard → exstrorezov-bot → Environment → добавить:\n"
+                f"2. Render Dashboard → hauding-bot → Environment → добавить:\n"
                 f"   <b>USER_SESSION_STRING</b> = вставленная строка\n"
                 f"3. Redeploy\n\n"
                 f"После этого сессия будет сохраняться между деплоями.")
         else:
             await safe_send(event.chat_id, "❌ User client не авторизован.\nСначала сделай /auth → /phone → /code")
+    except Exception as e:
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+
+async def cmd_restore_session(event):
+    """Восстанавливает сессию и настройки из бэкапа в канале вывода"""
+    if not is_owner(event): return
+    await safe_send(event.chat_id, "🔍 Ищу бэкап для восстановления...")
+    try:
+        restored = await restore_settings_from_backup()
+        if restored:
+            # Пробуем переподключить user client с новой session_string
+            ss_row = conn.execute("SELECT value FROM config WHERE key='user_session_string'").fetchone()
+            if ss_row and ss_row[0].strip():
+                global user_client
+                if user_client:
+                    try: await user_client.disconnect()
+                    except: pass
+                user_client = None
+                uc = get_user_client()  # создаст с session string из БД
+                await uc.connect()
+                if await uc.is_user_authorized():
+                    await safe_send(event.chat_id, "✅ User client подключён! Сессия восстановлена из бэкапа.")
+                    asyncio.create_task(user_searcher())
+                    return
+            await safe_send(event.chat_id, "📦 Настройки восстановлены, но нужна /auth для user client")
+        else:
+            await safe_send(event.chat_id, "❌ Бэкап не найден. Сделай /auth с нуля, потом /export_session")
     except Exception as e:
         await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
 
