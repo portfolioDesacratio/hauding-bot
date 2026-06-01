@@ -1741,9 +1741,8 @@ async def main():
     asyncio.create_task(self_pinger())
     asyncio.create_task(queue_worker())
     asyncio.create_task(init_user_client())
-    total_q = conn.execute("SELECT COUNT(*) FROM scrape_queue").fetchone()[0]
-    if total_q == 0:
-        asyncio.create_task(add_seed_channels())
+    # Seed-каналы добавляем всегда (INSERT OR IGNORE — дубликаты безопасны)
+    await add_seed_channels()
     # Persistent-каналы добавляем в любом случае (они могли не успеть добавиться при seed)
     asyncio.create_task(add_persistent_to_queue())
 
