@@ -1457,14 +1457,21 @@ def get_user_client():
     return user_client
 
 async def init_user_client():
-    """Проверяем сохранённую сессию при старте"""
+    """Проверяем сохранённую сессию при старте (env → БД → файл)"""
     uc = get_user_client()
     session_file = Path(str(USER_SESSION) + ".session")
     exists = session_file.exists()
-    log.info("👤 User client: сессия %s (файл %s)", "✅ существует" if exists else "❌ НЕТ", session_file)
-    log.info("📁 DATA_DIR: %s", DATA_DIR)
-    if not exists:
-        log.warning("👤 Файл сессии не найден — нужна /auth")
+    has_env_ss = bool(os.getenv("USER_SESSION_STRING", "").strip())
+    has_db_ss = bool(conn.execute("SELECT value FROM config WHERE key='user_session_string'").fetchone())
+    
+    log.info("👤 User client: файл %s, env %s, БД %s",
+             "✅" if exists else "❌",
+             "✅" if has_env_ss else "❌",
+             "✅" if has_db_ss else "❌")
+    
+    # Если есть хоть какой-то источник сессии — пробуем подключиться
+    if not (exists or has_env_ss or has_db_ss):
+        log.warning("👤 Нет сессии — нужна /auth")
         try:
             await client.send_message(OWNER_ID,
                 "⚠️ <b>User client сессия не найдена</b>\n"
@@ -1476,6 +1483,7 @@ async def init_user_client():
         except:
             pass
         return False
+    
     try:
         await uc.connect()
         if await uc.is_user_authorized():
