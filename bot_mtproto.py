@@ -274,53 +274,27 @@ def _parse_backup_lines(text):
     conn.commit()
     return True
 
-async def _save_backup_to_chat(chat_id, backup_text):
-    """Сохраняет/обновляет бэкап в указанном чате, возвращает msg_id"""
-    old_key = f"backup_msg_id_{chat_id}"
-    old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (old_key,)).fetchone()
-    if old_msg_id:
-        try:
-            await client.edit_message(chat_id, int(old_msg_id[0]), backup_text)
-            log.debug("💾 Бэкап обновлён в чате %s (msg_id=%s)", chat_id, old_msg_id[0])
-            return int(old_msg_id[0])
-        except Exception:
-            pass
-    msg = await client.send_message(chat_id, backup_text, parse_mode="html")
-    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (old_key, str(msg.id)))
-    conn.commit()
-    log.debug("💾 Бэкап создан в чате %s (msg_id=%s)", chat_id, msg.id)
-    return msg.id
-
 async def backup_settings_to_telegram():
-    """Сохраняет настройки обоим владельцам И в канал вывода"""
+    """Сохраняет настройки владельцу в ЛС (только я, без канала вывода)"""
     try:
         backup_text = _build_backup_text()
         
-        # 1. Шлём всем владельцам (каждый видит бэкап в своей личке с ботом)
-        for owner_id in OWNER_IDS:
-            try:
-                key = f"backup_msg_id_{owner_id}"
-                old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
-                if old_msg_id:
-                    try:
-                        await client.edit_message(owner_id, int(old_msg_id[0]), backup_text)
-                    except:
-                        msg = await client.send_message(owner_id, backup_text, parse_mode="html")
-                        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (key, str(msg.id)))
-                else:
-                    msg = await client.send_message(owner_id, backup_text, parse_mode="html")
-                    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (key, str(msg.id)))
-                conn.commit()
-            except Exception as e:
-                log.warning("Не удалось отправить бэкап владельцу %s: %s", owner_id, e)
-        
-        # 2. Сохраняем в канал вывода (бот админ → может читать при восстановлении)
-        target = get_output_chat() or FALLBACK_OUTPUT_CHAT
+        # Бэкап только владельцу (8587090554) — в ЛС с ботом
         try:
-            await _save_backup_to_chat(target, backup_text)
-            log.info("💾 Бэкап сохранён в канал %s", target)
+            key = f"backup_msg_id_{OWNER_ID}"
+            old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+            if old_msg_id:
+                try:
+                    await client.edit_message(OWNER_ID, int(old_msg_id[0]), backup_text)
+                except:
+                    msg = await client.send_message(OWNER_ID, backup_text, parse_mode="html")
+                    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (key, str(msg.id)))
+            else:
+                msg = await client.send_message(OWNER_ID, backup_text, parse_mode="html")
+                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (key, str(msg.id)))
+            conn.commit()
         except Exception as e:
-            log.warning("Не удалось сохранить бэкап в канал %s: %s", target, e)
+            log.warning("Не удалось отправить бэкап владельцу: %s", e)
             
     except Exception as e:
         log.warning("backup_settings_to_telegram: %s", e)
