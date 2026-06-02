@@ -463,7 +463,7 @@ async def auto_restart():
     """Через 10 минут выходит из бота — Render перезапустит контейнер"""
     if not IS_RENDER:
         return
-    await asyncio.sleep(600)  # 10 минут
+    await asyncio.sleep(300)  # 5 минут
     log.info("🔄 Автоматическая перезагрузка (10 мин) — сохраняю состояние...")
     try:
         await asyncio.wait_for(backup_settings_to_telegram(), timeout=30)
@@ -482,8 +482,8 @@ async def hard_deadline():
     """Страховка от зависания: если main() не завершился за 12 минут — os._exit(0)"""
     if not IS_RENDER:
         return
-    await asyncio.sleep(720)  # 12 минут
-    log.warning("🔥 ХАРД-ДЕДЛАЙН 12 мин! Форсированный выход.")
+    await asyncio.sleep(390)  # 6.5 минут (запас 1.5 мин после 5-минутного авторестарта)
+    log.warning("🔥 ХАРД-ДЕДЛАЙН 6.5 мин! Форсированный выход.")
     try:
         await asyncio.wait_for(client.disconnect(), timeout=5)
     except:
