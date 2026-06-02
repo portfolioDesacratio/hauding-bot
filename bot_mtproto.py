@@ -446,16 +446,73 @@ async def health_server():
 async def heartbeat():
     while True:
         await asyncio.sleep(60)
-        active_scrapes = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='active'").fetchone()[0]
-        pending_scrapes = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0]
-        log.info("💓 Пульс: база %d текстов, active=%d pending=%d",
-                 conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0],
-                 active_scrapes, pending_scrapes)
-        # Сохраняем прогресс каналов в бэкап каждую минуту (на случай краша)
         try:
-            await backup_settings_to_telegram()
+            active_scrapes = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='active'").fetchone()[0]
+            pending_scrapes = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0]
+            log.info("💓 Пульс: база %d текстов, active=%d pending=%d",
+                     conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0],
+                     active_scrapes, pending_scrapes)
+            # Сохраняем прогресс каналов в бэкап каждую минуту (на случай краша)
+            try:
+                await asyncio.wait_for(backup_settings_to_telegram(), timeout=20)
+            except Exception as e:
+                log.debug("heartbeat backup: %s", e)
         except Exception as e:
-            log.debug("heartbeat backup: %s", e)
+            log.warning("heartbeat error: %s", e)
+
+# ─── Watchdog: проверяет что все критические задачи живы ──────────────
+async def watchdog():
+    """Каждые 30 секунд проверяет что background-задачи не умерли.
+       Если какая-то умерла — прибиваем процесс, Render перезапустит."""
+    if not IS_RENDER:
+        return
+    tasks_to_monitor = {
+        "heartbeat": None,
+        "self_pinger": None,
+        "auto_restart": None,
+        "hard_deadline": None,
+        "queue_worker": None,
+    }
+    # Даём время задачам запуститься
+    await asyncio.sleep(10)
+    while True:
+        await asyncio.sleep(30)
+        try:
+            all_tasks = asyncio.all_tasks()
+            task_names = set()
+            for t in all_tasks:
+                name = t.get_name() if hasattr(t, 'get_name') else str(t)
+                # Telethon ручки не трогаем
+                if not name.startswith("Task-"):
+                    task_names.add(name)
+            
+            # Проверяем, есть ли наши задачи среди активных
+            for name in list(tasks_to_monitor.keys()):
+                found = any(name in str(t) for t in all_tasks)
+                if not found:
+                    log.error("🔥 Watchdog: задача '%s' не найдена! Перезагрузка.", name)
+                    try:
+                        await asyncio.wait_for(client.disconnect(), timeout=5)
+                    except:
+                        pass
+                    os._exit(1)
+            
+            # Дополнительно: проверяем что queue_worker обновляет heartbeat
+            qw_ts = conn.execute("SELECT value FROM config WHERE key='qw_heartbeat'").fetchone()
+            if qw_ts:
+                try:
+                    last_qw = datetime.fromisoformat(qw_ts[0])
+                    if (datetime.now() - last_qw).total_seconds() > 60:
+                        log.error("🔥 Watchdog: queue_worker не отвечал >60с! Перезагрузка.")
+                        try:
+                            await asyncio.wait_for(client.disconnect(), timeout=5)
+                        except:
+                            pass
+                        os._exit(1)
+                except:
+                    pass
+        except Exception as e:
+            log.warning("watchdog error: %s", e)
 
 # ─── Автоперезагрузка каждые 10 минут (Render перезапустит процесс) ──
 async def auto_restart():
@@ -465,12 +522,30 @@ async def auto_restart():
     await asyncio.sleep(600)  # 10 минут
     log.info("🔄 Автоматическая перезагрузка (10 мин) — сохраняю состояние...")
     try:
-        await backup_settings_to_telegram()
+        await asyncio.wait_for(backup_settings_to_telegram(), timeout=30)
     except Exception as e:
-        log.warning("auto_restart backup: %s", e)
+        log.warning("auto_restart backup (таймаут 30с): %s", e)
     log.info("🔄 Отключаю клиент для перезагрузки...")
-    await client.disconnect()
+    try:
+        await asyncio.wait_for(client.disconnect(), timeout=10)
+    except:
+        log.warning("🔄 Disconnect завис (10с таймаут), os._exit(0)")
+        os._exit(0)
     # run_until_disconnected() вернёт управление → main() завершится → Render перезапустит
+
+# 🔥 Хард-дедлайн: если авторестарт не сработал, через 12 мин форсированный выход
+async def hard_deadline():
+    """Страховка от зависания: если main() не завершился за 12 минут — os._exit(0)"""
+    if not IS_RENDER:
+        return
+    await asyncio.sleep(720)  # 12 минут
+    log.warning("🔥 ХАРД-ДЕДЛАЙН 12 мин! Форсированный выход.")
+    # Пробуем штатно отключиться, но если не выйдет — прибиваем процесс
+    try:
+        await asyncio.wait_for(client.disconnect(), timeout=5)
+    except:
+        pass
+    os._exit(0)
 
 async def self_pinger():
     """Пингует Render URL каждые 5 минут, чтобы контейнер не уснул"""
@@ -2126,6 +2201,8 @@ async def main():
     asyncio.create_task(heartbeat())
     asyncio.create_task(self_pinger())
     asyncio.create_task(auto_restart())
+    asyncio.create_task(hard_deadline())
+    asyncio.create_task(watchdog())
     
     # 1. Подключаем user-клиент (нужен для чтения каналов и бэкапа)
     user_ok = await init_user_client()
