@@ -589,6 +589,14 @@ async def broadcast_file(text, filename, event):
 def is_owner(event):
     return event.sender_id in OWNER_IDS
 
+async def notify_owners(text, parse_mode="html"):
+    """Отправляет сообщение всем владельцам бота"""
+    for uid in OWNER_IDS:
+        try:
+            await client.send_message(uid, text, parse_mode=parse_mode)
+        except Exception as e:
+            log.warning("Не отправилось владельцу %s: %s", uid, e)
+
 async def safe_send(chat_id, text, parse_mode="html"):
     try:
         await client.send_message(chat_id, text, parse_mode=parse_mode)
@@ -1596,13 +1604,12 @@ async def init_user_client():
     if not (exists or has_env_ss or has_db_ss):
         log.warning("👤 Нет сессии — нужна /auth")
         try:
-            await client.send_message(OWNER_ID,
+            await notify_owners(
                 "⚠️ <b>User client сессия не найдена</b>\n"
                 "Отправь:\n"
                 "/auth\n"
                 "/phone +79122502717\n"
-                "Далее код по цифрам: 1 2 3 4 5",
-                parse_mode="html")
+                "Далее код по цифрам: 1 2 3 4 5")
         except:
             pass
         return False
@@ -1623,19 +1630,17 @@ async def init_user_client():
             asyncio.create_task(user_searcher())
             # Уведомляем что всё ок
             try:
-                await client.send_message(OWNER_ID,
-                    "✅ <b>User client авторизован</b> (сессия восстановлена)",
-                    parse_mode="html")
+                await notify_owners(
+                    "✅ <b>User client авторизован</b> (сессия восстановлена)")
             except:
                 pass
             return True
         else:
             log.info("👤 User client: сессия недействительна, нужна /auth")
             try:
-                await client.send_message(OWNER_ID,
+                await notify_owners(
                     "⚠️ <b>User client сессия недействительна</b>\n"
-                    "Нужна переавторизация: /auth",
-                    parse_mode="html")
+                    "Нужна переавторизация: /auth")
             except:
                 pass
             return False
@@ -2149,7 +2154,7 @@ async def main():
     restored_settings.append(f"📚 Текстов в базе: {texts_count}")
     startup_msg = "🔄 <b>Бот перезапущен</b>\n" + "\n".join(f"• {s}" for s in restored_settings)
     try:
-        await client.send_message(OWNER_ID, startup_msg, parse_mode="html")
+        await notify_owners(startup_msg)
     except:
         pass
     
