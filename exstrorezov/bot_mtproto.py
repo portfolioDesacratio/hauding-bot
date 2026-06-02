@@ -476,9 +476,25 @@ async def send_to_output(text, source_title=None, source_link=None):
             log.warning("Не отправилось в канал: %s", e)
 
 # ─── Broadcast .txt файла частями в канал ──────────────────────────
+# Слова-паразиты для удаления из текстов
+_BROADCAST_BAD_WORDS = re.compile(
+    r'\b(?:тфотт|сравалерия|ссавалерия|ваффен|шаббат|сраббат|среон|ксеон|оккультизм|сраккультизм)\b',
+    re.IGNORECASE,
+)
+
+def _clean_broadcast_text(text: str) -> str:
+    """Удаляет плохие слова из текста для broadcast"""
+    text = _BROADCAST_BAD_WORDS.sub('', text)
+    text = re.sub(r' +', ' ', text).strip()
+    return text
+
 async def broadcast_file(text, filename, event):
     """Разбивает текст на части по ~600 слов и отправляет в канал с интервалом ~4с"""
     global _last_send_time
+    
+    # Удаляем плохие слова из файла
+    text = _clean_broadcast_text(text)
+    
     words = text.split()
     total = len(words)
     chunk_size = 600
@@ -620,6 +636,7 @@ async def on_msg(event):
                 fb = await msg.download_media(file=bytes)
                 if not fb: fb = await client.download_file(msg.document, file=bytes)
                 text_content = fb.decode("utf-8", errors="replace")
+                text_content = _clean_broadcast_text(text_content)  # удаляем плохие слова
                 
                 # Если файл прислал владелец в ЛС — broadcast частями
                 if event.is_private and is_owner(event):
