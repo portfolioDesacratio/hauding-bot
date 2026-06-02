@@ -212,6 +212,13 @@ def _build_backup_text():
     if auto: lines.append(f"autosearch={auto[0]}")
     pers = get_persistent_channels()
     if pers: lines.append(f"persistent={','.join(pers)}")
+    # Сохраняем прогресс по каждому каналу (last_msg_id) — после рестарта не начинаем с нуля
+    ch_rows = conn.execute(
+        "SELECT username, last_msg_id FROM scrape_queue WHERE last_msg_id > 0 ORDER BY username"
+    ).fetchall()
+    if ch_rows:
+        progress_parts = [f"{r[0]}:{r[1]}" for r in ch_rows[:50]]  # макс 50 каналов
+        lines.append(f"channel_progress={','.join(progress_parts)}")
     return "\n".join(lines)
 
 def _parse_backup_lines(text):
@@ -249,6 +256,21 @@ def _parse_backup_lines(text):
             if val:
                 conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("persistent_channels", val))
                 log.info("📦 Восстановлены persistent-каналы: %s", val)
+        elif line.startswith("channel_progress="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                restored_count = 0
+                for chunk in val.split(","):
+                    chunk = chunk.strip()
+                    if ":" not in chunk: continue
+                    ch_name, ch_msg_id = chunk.split(":", 1)
+                    if ch_name and ch_msg_id.isdigit():
+                        conn.execute(
+                            "UPDATE scrape_queue SET last_msg_id=max(last_msg_id, ?) WHERE username=?",
+                            (int(ch_msg_id), ch_name)
+                        )
+                        restored_count += 1
+                log.info("📦 Восстановлен прогресс %d каналов", restored_count)
     conn.commit()
     return True
 
@@ -270,25 +292,27 @@ async def _save_backup_to_chat(chat_id, backup_text):
     return msg.id
 
 async def backup_settings_to_telegram():
-    """Сохраняет настройки владельцу (для глаз) И в канал вывода (для восстановления)"""
+    """Сохраняет настройки обоим владельцам И в канал вывода"""
     try:
         backup_text = _build_backup_text()
         
-        # 1. Всегда шлём владельцу (визуальный контроль)
-        try:
-            old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (BACKUP_MSG_ID_KEY,)).fetchone()
-            if old_msg_id:
-                try:
-                    await client.edit_message(OWNER_ID, int(old_msg_id[0]), backup_text)
-                except:
-                    msg = await client.send_message(OWNER_ID, backup_text, parse_mode="html")
-                    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
-            else:
-                msg = await client.send_message(OWNER_ID, backup_text, parse_mode="html")
-                conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
-            conn.commit()
-        except Exception as e:
-            log.warning("Не удалось отправить бэкап владельцу: %s", e)
+        # 1. Шлём всем владельцам (каждый видит бэкап в своей личке с ботом)
+        for owner_id in OWNER_IDS:
+            try:
+                key = f"backup_msg_id_{owner_id}"
+                old_msg_id = conn.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+                if old_msg_id:
+                    try:
+                        await client.edit_message(owner_id, int(old_msg_id[0]), backup_text)
+                    except:
+                        msg = await client.send_message(owner_id, backup_text, parse_mode="html")
+                        conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (key, str(msg.id)))
+                else:
+                    msg = await client.send_message(owner_id, backup_text, parse_mode="html")
+                    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (key, str(msg.id)))
+                conn.commit()
+            except Exception as e:
+                log.warning("Не удалось отправить бэкап владельцу %s: %s", owner_id, e)
         
         # 2. Сохраняем в канал вывода (бот админ → может читать при восстановлении)
         target = get_output_chat() or FALLBACK_OUTPUT_CHAT
@@ -427,9 +451,11 @@ async def health_server():
 async def heartbeat():
     while True:
         await asyncio.sleep(60)
-        log.info("💓 Пульс: база %d текстов, очередь %d pending",
+        active_scrapes = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='active'").fetchone()[0]
+        pending_scrapes = conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0]
+        log.info("💓 Пульс: база %d текстов, active=%d pending=%d",
                  conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0],
-                 conn.execute("SELECT COUNT(*) FROM scrape_queue WHERE status='pending'").fetchone()[0])
+                 active_scrapes, pending_scrapes)
 
 async def self_pinger():
     """Пингует Render URL каждые 5 минут, чтобы контейнер не уснул"""
@@ -439,9 +465,17 @@ async def self_pinger():
     while True:
         await asyncio.sleep(300)  # 5 минут
         try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: __import__('urllib').request.urlopen(ping_url, timeout=10))
-            log.debug("🏓 Self-ping OK")
+            # Асинхронный HTTP запрос — не блокирует event loop
+            import aiohttp
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(ping_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        log.debug("🏓 Self-ping → %s", resp.status)
+            except ImportError:
+                # fallback на синхронный urllib
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: __import__('urllib.request').urlopen(ping_url, timeout=10))
+                log.debug("🏓 Self-ping OK (urllib)")
         except Exception as e:
             log.debug("🏓 Self-ping: %s", e)
 
@@ -468,12 +502,14 @@ async def send_to_output(text, source_title=None, source_link=None):
             log.debug("⏳ Rate limit send: жду %.1fс", wait)
             await asyncio.sleep(wait)
         try:
-            await client.send_message(out, message, parse_mode="html")
+            await safe_send_message(client, out, message, parse_mode="html")
             _last_send_time = asyncio.get_event_loop().time()
             log.info("📤 Отправлено в канал вывода")
         except errors.FloodWaitError as e:
-            log.warning("⏳ FloodWait при отправке: %dс", e.seconds)
-            await asyncio.sleep(min(e.seconds, 10))
+            log.warning("⏳ FloodWait при отправке: %dс (ждём)", e.seconds)
+            await asyncio.sleep(min(e.seconds, 30))
+            # после FloodWait обновляем время — следующий send подождёт 3с
+            _last_send_time = asyncio.get_event_loop().time()
         except Exception as e:
             log.warning("Не отправилось в канал: %s", e)
 
@@ -534,12 +570,13 @@ async def broadcast_file(text, filename, event):
             if since_last < 3.0:
                 await asyncio.sleep(3.0 - since_last)
             try:
-                await client.send_message(out, message, parse_mode="html")
+                await safe_send_message(client, out, message, parse_mode="html")
                 _last_send_time = asyncio.get_event_loop().time()
                 log.info("📤 Broadcast %s %d/%d", filename, i, total_chunks)
             except errors.FloodWaitError as e:
-                log.warning("⏳ FloodWait broadcast: %dс", e.seconds)
-                await asyncio.sleep(min(e.seconds, 10))
+                log.warning("⏳ FloodWait broadcast: %dс (ждём)", e.seconds)
+                await asyncio.sleep(min(e.seconds, 30))
+                _last_send_time = asyncio.get_event_loop().time()
             except Exception as e:
                 log.warning("Broadcast ошибка: %s", e)
         
@@ -1128,19 +1165,28 @@ async def safe_api_call(client_obj, method_name, *args, min_delay=0.35, **kwargs
     max_retries = 5
     
     for attempt in range(max_retries + 1):
-        # Rate limit: ждём min_delay с последнего вызова
+        # Rate limit: макс MAX_API_CALLS_PER_SEC вызовов в секунду на клиент
+        # + мин пауза min_delay между вызовами
         async with _api_lock:
             now = time.monotonic()
-            last_times = _api_call_times.get(client_id, [])
-            # Очищаем вызовы старше 1с
-            last_times = [t for t in last_times if now - t < 1.0]
-            if last_times:
-                time_since_last = now - last_times[-1]
+            times = _api_call_times.get(client_id, [])
+            # Оставляем только вызовы за последнюю секунду
+            times = [t for t in times if now - t < 1.0]
+            if len(times) >= MAX_API_CALLS_PER_SEC:
+                # Достигнут лимит — ждём, пока освободится слот
+                wait = times[0] + 1.0 - now
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                    now = time.monotonic()
+                times = [t for t in times if now - t < 1.0]
+            # Минимальная пауза между вызовами
+            if times:
+                time_since_last = now - times[-1]
                 if time_since_last < min_delay:
                     await asyncio.sleep(min_delay - time_since_last)
                     now = time.monotonic()
-            last_times.append(now)
-            _api_call_times[client_id] = last_times
+            times.append(now)
+            _api_call_times[client_id] = times
         
         try:
             method = getattr(client_obj, method_name)
@@ -1311,8 +1357,8 @@ async def scrape_channel(username, resume_from=0, retries=0):
 async def queue_worker():
     """Постоянно сканирует каналы с ограничением конкурентности"""
     active_tasks = {}  # username -> task
-    MAX_CONCURRENT = 999  # без лимита — все каналы сразу, rate limit только на get_entity
-    log.info("🚀 Queue worker запущен — макс %d каналов одновременно", MAX_CONCURRENT)
+    MAX_CONCURRENT = 3  # макс 3 канала одновременно — предотвращает FloodWait
+    log.info("🚀 Queue worker запущен — макс %d канала одновременно", MAX_CONCURRENT)
 
     async def run_scrape(username, last_msg_id):
         """Обёртка для scrape_channel с таймаутом"""
@@ -1360,10 +1406,11 @@ async def queue_worker():
                     active_tasks[row[0]] = task
                     log.info("🚀 Запущен @%s (всего активно: %d)", row[0], len(active_tasks))
 
-            # Если ничего не запущено — перепроверяем done-каналы (до 5 одновременно)
+            # Если ничего не запущено — перепроверяем done-каналы (макс MAX_CONCURRENT)
             if not active_tasks:
                 done_rows = conn.execute(
-                    "SELECT username,last_msg_id FROM scrape_queue WHERE status='done' ORDER BY RANDOM() LIMIT 5"
+                    "SELECT username,last_msg_id FROM scrape_queue WHERE status='done' ORDER BY RANDOM() LIMIT ?",
+                    (MAX_CONCURRENT,)
                 ).fetchall()
                 for row in done_rows:
                     if row[0] not in active_tasks:
