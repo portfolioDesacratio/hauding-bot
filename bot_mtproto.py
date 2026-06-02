@@ -152,6 +152,7 @@ EXCLUDED_CHANNELS = {"desacratio", "thesaurus", "exstrorezov", "vldvstk3000", "m
 # ─── Многослойная дедупликация ──────────────────────────────────────
 # Слой 1: in-memory счётчик на текущую сессию (не依赖 от БД)
 _sess_dup = {}  # content_hash -> сколько раз ОТПРАВИЛИ за эту сессию
+_SENT_HASHES = set()  # SHA256 хэши текстов, уже отправленных в канал вывода
 
 def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     content = content.strip()
@@ -536,13 +537,13 @@ async def watchdog():
         except Exception as e:
             log.warning("watchdog error: %s", e)
 
-# ─── Автоперезагрузка каждые 10 минут (Render перезапустит процесс) ──
+# ─── Автоперезагрузка каждые 5 минут (Render перезапустит процесс) ──
 async def auto_restart():
-    """Через 10 минут выходит из бота — Render перезапустит контейнер"""
+    """Через 5 минут выходит из бота — Render перезапустит контейнер"""
     if not IS_RENDER:
         return
     await asyncio.sleep(300)  # 5 минут
-    log.info("🔄 Автоматическая перезагрузка (10 мин) — сохраняю состояние...")
+    log.info("🔄 Автоматическая перезагрузка (5 мин) — сохраняю состояние...")
     try:
         await asyncio.wait_for(backup_settings_to_telegram(), timeout=30)
     except Exception as e:
@@ -591,12 +592,34 @@ async def self_pinger():
         except Exception as e:
             log.debug("🏓 Self-ping: %s", e)
 
-# ─── Отправка в выходной канал (с глобальным rate limit) ──────────
+# ─── Telegram-based dedup — сканируем канал вывода при старте ──────
+async def _load_sent_hashes():
+    """Сканирует канал вывода, строит множество SHA256 хэшей уже отправленных текстов.
+       Эта проверка НЕ зависит от файловой системы — работает через сам Telegram.
+       Переживает любые рестарты и пересоздания инстанса Render."""
+    global _SENT_HASHES
+    _SENT_HASHES.clear()
+    out = get_output_chat()
+    if not out:
+        log.warning("⚠️ Telegram dedup: канал вывода не назначен")
+        return
+    try:
+        count = 0
+        async for msg in client.iter_messages(out, limit=10000):
+            if msg.text and len(msg.text) >= 20:  # короткие системные сообщения пропускаем
+                _SENT_HASHES.add(hashlib.sha256(msg.text.encode("utf-8")).hexdigest())
+                count += 1
+        log.info("📋 Telegram dedup: загружено %d хэшей из %d сообщений в канале вывода",
+                 len(_SENT_HASHES), count)
+    except Exception as e:
+        log.warning("⚠️ Telegram dedup: не удалось просканировать канал: %s", e)
+
+# ─── Отправка в выходной канал (с глобальным rate limit + Telegram dedup) ─
 _last_send_time = 0.0
 _send_lock = asyncio.Lock()
 
 async def send_to_output(text, source_title=None, source_link=None):
-    global _last_send_time
+    global _last_send_time, _SENT_HASHES
     out = get_output_chat()
     if not out: return
 
@@ -604,6 +627,19 @@ async def send_to_output(text, source_title=None, source_link=None):
     message = text_clean
     if len(message) > 3950:
         message = message[:3950] + "\n\n✂️ ..."
+    
+    # ─── Telegram dedup: проверяем что такой текст ещё не отправляли ──
+    # Хэшируем текст в том виде, как его увидит пользователь в канале:
+    # Telegram хранит HTML-сущности (&lt; → <) уже декодированными.
+    # Поэтому для обеих сторон (проверка перед отправкой и msg.text при сканировании)
+    # используем html.unescape() чтобы получить единую каноническую форму.
+    import html as _html
+    canonical = _html.unescape(message)
+    msg_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if msg_hash in _SENT_HASHES:
+        log.warning("🚫 Telegram dedup: текст с хэшем %s уже есть в канале вывода, пропускаю", msg_hash[:8])
+        # Всё равно сохраняем в базу (чтобы счётчик текстов был верным)
+        return  # ← не отправляем дубль
 
     # Rate limit + отправка под одним lock — предотвращает FloodWait
     async with _send_lock:
@@ -616,7 +652,9 @@ async def send_to_output(text, source_title=None, source_link=None):
         try:
             await safe_send_message(client, out, message, parse_mode="html")
             _last_send_time = asyncio.get_event_loop().time()
-            log.info("📤 Отправлено в канал вывода")
+            # Добавляем хэш в множество — этот текст больше не отправится
+            _SENT_HASHES.add(msg_hash)
+            log.info("📤 Отправлено в канал вывода (хэш %s)", msg_hash[:8])
         except errors.FloodWaitError as e:
             log.warning("⏳ FloodWait при отправке: %dс (ждём)", e.seconds)
             await asyncio.sleep(min(e.seconds, 30))
@@ -2246,7 +2284,10 @@ async def main():
         else:
             log.info("📦 Бэкап не найден, всё придётся настроить заново")
     
-    # 3. Seed-каналы добавляем всегда (INSERT OR IGNORE — дубликаты безопасны)
+    # 3️⃣ Сканируем канал вывода — строим Telegram-based dedup (переживает пересоздание инстанса)
+    await _load_sent_hashes()
+    
+    # 4️⃣ Seed-каналы добавляем всегда (INSERT OR IGNORE — дубликаты безопасны)
     await add_seed_channels()
     # Сбрасываем error-каналы обратно в pending (чтобы перезапустились с новым лимитом)
     reset = conn.execute(
@@ -2258,7 +2299,7 @@ async def main():
     # Persistent-каналы добавляем в любом случае
     await add_persistent_to_queue()
     
-    # 4. Шлём уведомление владельцу с актуальным состоянием
+    # 5️⃣ Шлём уведомление владельцу с актуальным состоянием
     restored_settings = []
     out_ch = get_output_chat()
     if out_ch: restored_settings.append(f"📤 Канал вывода: {out_ch}")
@@ -2270,13 +2311,14 @@ async def main():
     if pers: restored_settings.append(f"📌 Persistent: {len(pers)} каналов")
     texts_count = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
     restored_settings.append(f"📚 Текстов в базе: {texts_count}")
+    restored_settings.append(f"🔐 Telegram dedup: {len(_SENT_HASHES)} хэшей загружено")
     startup_msg = "🔄 <b>Бот перезапущен</b>\n" + "\n".join(f"• {s}" for s in restored_settings)
     try:
         await notify_owners(startup_msg)
     except:
         pass
     
-    # 5. Queue worker запускаем ПОСЛЕ того, как всё готово
+    # 6️⃣ Queue worker запускаем ПОСЛЕ того, как всё готово
     asyncio.create_task(queue_worker())
 
     await client.run_until_disconnected()
