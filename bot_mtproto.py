@@ -22,10 +22,9 @@ if env_path.exists():
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
 
-# Snap-credentials Telegram Desktop — код приходит через Telegram (не SMS)
-# Отдельный API_ID = отдельный FloodWait, номер не блокируется
-API_ID = 611335
-API_HASH = "d524b414d21f4d37f08684c1df41ac9c"
+# Твои оригинальные credentials от my.telegram.org — 100% рабочие
+API_ID = 38676925
+API_HASH = "c86fc69f034a424e9486ed706e6be019"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     log.error("Задай BOT_TOKEN в .env"); sys.exit(1)
