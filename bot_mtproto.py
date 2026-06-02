@@ -456,6 +456,26 @@ async def heartbeat():
         log.info("💓 Пульс: база %d текстов, active=%d pending=%d",
                  conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0],
                  active_scrapes, pending_scrapes)
+        # Сохраняем прогресс каналов в бэкап каждую минуту (на случай краша)
+        try:
+            await backup_settings_to_telegram()
+        except Exception as e:
+            log.debug("heartbeat backup: %s", e)
+
+# ─── Автоперезагрузка каждые 10 минут (Render перезапустит процесс) ──
+async def auto_restart():
+    """Через 10 минут выходит из бота — Render перезапустит контейнер"""
+    if not IS_RENDER:
+        return
+    await asyncio.sleep(600)  # 10 минут
+    log.info("🔄 Автоматическая перезагрузка (10 мин) — сохраняю состояние...")
+    try:
+        await backup_settings_to_telegram()
+    except Exception as e:
+        log.warning("auto_restart backup: %s", e)
+    log.info("🔄 Отключаю клиент для перезагрузки...")
+    await client.disconnect()
+    # run_until_disconnected() вернёт управление → main() завершится → Render перезапустит
 
 async def self_pinger():
     """Пингует Render URL каждые 5 минут, чтобы контейнер не уснул"""
@@ -2110,6 +2130,7 @@ async def main():
     # Фоновые задачи (кроме queue_worker — он позже)
     asyncio.create_task(heartbeat())
     asyncio.create_task(self_pinger())
+    asyncio.create_task(auto_restart())
     
     # 1. Подключаем user-клиент (нужен для чтения каналов и бэкапа)
     user_ok = await init_user_client()
