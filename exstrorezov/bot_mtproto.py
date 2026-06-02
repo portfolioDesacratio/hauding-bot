@@ -106,7 +106,7 @@ _keyword_blocked = [
 ]
 
 # Каналы, которые НЕ надо обрабатывать
-EXCLUDED_CHANNELS = {"desacratio", "thesaurus", "exstrorezov", "vldvstk3000", "mtbarmoscow", "howdie_mickoski"}
+EXCLUDED_CHANNELS = {"desacratio", "thesaurus", "exstrorezov", "vldvstk3000", "mtbarmoscow", "howdie_mickoski", "a_toolsx"}
 
 def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     content = content.strip()
@@ -508,6 +508,10 @@ async def on_msg(event):
         # Пропускаем исключённые каналы (но не ЛС владельца — там файлы и команды)
         if not event.is_private and chat_username in EXCLUDED_CHANNELS:
             log.debug("⏭️ Пропущен исключённый канал: @%s", chat_username)
+            return
+        # Фильтр спама от @A_ToolsX и подобных
+        if msg.text and ("A_ToolsX" in msg.text or "To use this bot, you must join our channel" in msg.text):
+            log.debug("⏭️ Пропущен спам: %s", msg.text[:80])
             return
         # Пропускаем канал вывода
         out_ch = get_output_chat()
