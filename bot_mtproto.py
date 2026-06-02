@@ -46,6 +46,8 @@ conn.execute("""CREATE TABLE IF NOT EXISTS texts (
     source_chat TEXT, source_chat_title TEXT, source_message_id INTEGER,
     source_link TEXT, collected_at TEXT DEFAULT (datetime('now')),
     word_count INTEGER DEFAULT 0)""")
+conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_texts_msg 
+    ON texts(source_chat, source_message_id)""")
 conn.execute("""CREATE TABLE IF NOT EXISTS scrape_queue (
     username TEXT PRIMARY KEY, title TEXT,
     added_at TEXT DEFAULT (datetime('now')),
@@ -161,6 +163,17 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
         log.debug("⏭️ Пропущен текст (нет троллинг-лексики): %d слов из %s", wc(content), chat_title)
         return False
     
+    # Проверка: это сообщение (chat_id + msg_id) уже сохранено? Тогда пропускаем.
+    # Это предотвращает дубли when on_msg И scrape_channel обрабатывают одно и то же сообщение.
+    if chat_id != "?" and msg_id is not None:
+        existing = conn.execute(
+            "SELECT 1 FROM texts WHERE source_chat=? AND source_message_id=?",
+            (chat_id, msg_id)
+        ).fetchone()
+        if existing:
+            log.debug("⏭️ Сообщение уже сохранено: %s msg#%s из %s", chat_id, msg_id, chat_title)
+            return False
+    
     # Дедупликация: одинаковый текст сохраняем максимум MAX_TEXT_DUPLICATES раз
     # На 3й раз текст БЛОКИРУЕТСЯ навсегда — banned=1, никогда не пройдёт
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -182,9 +195,17 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
         dup_num = 1
     
     words = wc(content)
-    conn.execute("INSERT INTO texts (content,source_chat,source_chat_title,source_message_id,source_link,word_count) VALUES (?,?,?,?,?,?)",
+    conn.execute("INSERT OR IGNORE INTO texts (content,source_chat,source_chat_title,source_message_id,source_link,word_count) VALUES (?,?,?,?,?,?)",
                  (content, chat_id, chat_title, msg_id, link, words))
     conn.commit()
+    # Проверяем, реально ли вставилась строка (INSERT OR IGNORE мог не вставить)
+    actually_saved = conn.execute(
+        "SELECT 1 FROM texts WHERE source_chat=? AND source_message_id=?",
+        (chat_id, msg_id)
+    ).fetchone()
+    if not actually_saved:
+        log.debug("⏭️ INSERT OR IGNORE не вставил (уже есть): %s msg#%s", chat_id, msg_id)
+        return False
     log.info("💾 %d слов из %s | канал #%s (дубль %d/%d)", words, chat_title, chat_id, dup_num, MAX_TEXT_DUPLICATES)
     return True
 
