@@ -149,58 +149,86 @@ _keyword_blocked = [
 # Каналы, которые НЕ надо обрабатывать
 EXCLUDED_CHANNELS = {"desacratio", "thesaurus", "exstrorezov", "vldvstk3000", "mtbarmoscow", "howdie_mickoski", "a_toolsx"}
 
+# ─── Многослойная дедупликация ──────────────────────────────────────
+# Слой 1: in-memory счётчик на текущую сессию (не依赖 от БД)
+_sess_dup = {}  # content_hash -> сколько раз ОТПРАВИЛИ за эту сессию
+
 def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     content = content.strip()
-    if not content or wc(content) < MIN_WORDS: return False
+    if not content or wc(content) < MIN_WORDS:
+        log.debug("⏭️ save_text: пусто/<50слов от %s", chat_title)
+        return False
     
     # Фильтр по ключевым словам
     if not text_matches_keywords(content):
-        log.debug("⏭️ Пропущен текст (нет ключевых слов): %d слов из %s", wc(content), chat_title)
+        log.debug("⏭️ save_text: нет ключевых слов от %s", chat_title)
         return False
     
-    # Фильтр троллинг-лексики: текст должен содержать минимум N матерных/агрессивных слов
+    # Фильтр троллинг-лексики
     if not has_trolling_content(content):
-        log.debug("⏭️ Пропущен текст (нет троллинг-лексики): %d слов из %s", wc(content), chat_title)
+        log.debug("⏭️ save_text: нет троллинг-лексики от %s", chat_title)
         return False
     
-    # 1) Проверка: это сообщение (chat_id + msg_id) уже сохранено?
+    # ────────────────────────────────────────────────────────────────
+    # СЛОЙ 1: проверка что это сообщение (chat_id+msg_id) уже сохранено
+    # ────────────────────────────────────────────────────────────────
     if chat_id != "?" and msg_id is not None:
         existing = conn.execute(
             "SELECT 1 FROM texts WHERE source_chat=? AND source_message_id=?",
             (chat_id, msg_id)
         ).fetchone()
         if existing:
-            log.debug("⏭️ Сообщение уже сохранено: %s msg#%s из %s", chat_id, msg_id, chat_title)
+            log.debug("⏭️ save_text: msg#%s из %s уже в БД (слой1)", msg_id, chat_title)
             return False
     
-    # 2) Дедупликация по содержимому: считаем сколько РАЗ этот текст УЖЕ в БД
-    #    (не по хешу, а напрямую — хеш может сброситься при краше)
-    current_count = conn.execute(
+    # ────────────────────────────────────────────────────────────────
+    # СЛОЙ 2: in-memory счётчик сессии — текст УЖЕ отправляли в этой сессии?
+    # ────────────────────────────────────────────────────────────────
+    ch = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    sess_sent = _sess_dup.get(ch, 0)
+    if sess_sent >= MAX_TEXT_DUPLICATES:
+        log.warning("🚫 СЛОЙ2 (сессия) — уже отправляли %d раз: %d слов из %s",
+                    sess_sent, wc(content), chat_title)
+        return False
+    # пока не увеличиваем — увеличим только если реально сохранится в БД
+    
+    # ────────────────────────────────────────────────────────────────
+    # СЛОЙ 3: COUNT(*) в БД — сколько раз этот текст УЖЕ сохранён
+    # ────────────────────────────────────────────────────────────────
+    db_count = conn.execute(
         "SELECT COUNT(*) FROM texts WHERE content=?",
         (content,)
     ).fetchone()[0]
-    if current_count >= MAX_TEXT_DUPLICATES:
-        log.warning("🚫 Дубликат (в БД уже %d копий): %d слов из %s",
-                    current_count, wc(content), chat_title)
+    if db_count >= MAX_TEXT_DUPLICATES:
+        log.warning("🚫 СЛОЙ3 (БД) — уже %d копий в БД: %d слов из %s",
+                    db_count, wc(content), chat_title)
         return False
     
-    # 3) Сохраняем (INSERT OR IGNORE — защита от race condition через UNIQUE индекс)
+    # ────────────────────────────────────────────────────────────────
+    # Сохраняем
+    # ────────────────────────────────────────────────────────────────
     words = wc(content)
     conn.execute("INSERT OR IGNORE INTO texts (content,source_chat,source_chat_title,source_message_id,source_link,word_count) VALUES (?,?,?,?,?,?)",
                  (content, chat_id, chat_title, msg_id, link, words))
     conn.commit()
     
-    # Проверяем, реально ли вставилась строка (INSERT OR IGNORE мог не вставить)
+    # Проверяем что реально вставилось
+    rowid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     actually_saved = conn.execute(
         "SELECT 1 FROM texts WHERE source_chat=? AND source_message_id=?",
         (chat_id, msg_id)
     ).fetchone()
+    
     if not actually_saved:
-        log.debug("⏭️ INSERT OR IGNORE не вставил (уже есть): %s msg#%s", chat_id, msg_id)
+        log.warning("⏭️ save_text: INSERT OR IGNORE проигнорирован (msg#%s из %s уже есть)", msg_id, chat_title)
         return False
     
-    log.info("💾 %d слов из %s | канал #%s (всего копий в БД: %d/%d)",
-             words, chat_title, chat_id, current_count + 1, MAX_TEXT_DUPLICATES)
+    # Увеличиваем счётчик сессии ТОЛЬКО после успешного сохранения
+    _sess_dup[ch] = sess_sent + 1
+    
+    log.info("💾 %d слов из %s | канал #%s | msg#%s (сессия: %d, БД: %d/%d)",
+             words, chat_title, chat_id, msg_id,
+             _sess_dup[ch], db_count + 1, MAX_TEXT_DUPLICATES)
     return True
 
 session_path = str(DATA_DIR / "mt_session")
@@ -728,6 +756,7 @@ async def on_msg(event):
         if msg.text and wc(msg.text) >= MIN_WORDS:
             link = f"https://t.me/{chat.username}/{msg.id}" if getattr(chat, "username", None) else None
             if save_text(msg.text, title, str(chat.id), msg.id, link):
+                log.info("📤 on_msg → send_to_output: %s msg#%s из %s", chat.id, msg.id, title)
                 await send_to_output(msg.text, title, link)
 
         # Ищем ссылки на каналы
@@ -1419,6 +1448,8 @@ async def scrape_channel(username, resume_from=0, retries=0):
             if msg.text and wc(msg.text) >= MIN_WORDS:
                 link = f"https://t.me/{entity.username}/{msg.id}" if getattr(entity, "username", None) else None
                 if save_text(msg.text, title, str(entity.id), msg.id, link):
+                    log.info("📤 scrape_channel → send_to_output: %s msg#%s из %s",
+                             entity.id, msg.id, title)
                     await send_to_output(msg.text, title, link)
                 saved += 1
             # Задержка между сообщениями — предотвращает FloodWait
