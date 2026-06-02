@@ -22,12 +22,10 @@ if env_path.exists():
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
 
-# Твои оригинальные credentials от my.telegram.org — 100% рабочие
-API_ID = 38676925
-API_HASH = "c86fc69f034a424e9486ed706e6be019"
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    log.error("Задай BOT_TOKEN в .env"); sys.exit(1)
+# Все credentials только из переменных окружения — ничего не захардкожено!
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 OWNER_IDS = {8587090554, 895508019}  # я + друг
 OWNER_ID = 8587090554  # @desacratio (для уведомлений)
