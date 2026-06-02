@@ -480,77 +480,49 @@ async def heartbeat():
         except Exception as e:
             log.warning("heartbeat error: %s", e)
 
-# ─── Автоперезагрузка каждые 5 минут (Render перезапустит процесс) ──
+# auto_restart отключён — каждые 5 минут убивал процесс, Render переставал рестартить
 async def auto_restart():
-    """Через 5 минут выходит из бота — Render перезапустит контейнер"""
-    if not IS_RENDER:
-        return
-    await asyncio.sleep(300)  # 5 минут
-    log.info("🔄 Автоматическая перезагрузка (5 мин) — сохраняю состояние...")
-    try:
-        await asyncio.wait_for(backup_settings_to_telegram(), timeout=30)
-    except Exception as e:
-        log.warning("auto_restart backup (таймаут 30с): %s", e)
-    log.info("🔄 Отключаю клиент для перезагрузки...")
-    try:
-        await asyncio.wait_for(client.disconnect(), timeout=10)
-    except:
-        log.warning("🔄 Disconnect завис (10с таймаут), os._exit(0)")
-        os._exit(0)
-    # run_until_disconnected() вернёт управление → main() завершится → Render перезапустит
+    """Отключено. Авторестарт вызывал дубликаты и остановку бота."""
+    pass
 
-# 🔥 Хард-дедлайн: если авторестарт не сработал, через 12 мин форсированный выход
 async def hard_deadline():
-    """Страховка от зависания: если main() не завершился за 12 минут — os._exit(0)"""
-    if not IS_RENDER:
-        return
-    await asyncio.sleep(390)  # 6.5 минут (запас 1.5 мин после 5-минутного авторестарта)
-    log.warning("🔥 ХАРД-ДЕДЛАЙН 6.5 мин! Форсированный выход.")
-    try:
-        await asyncio.wait_for(client.disconnect(), timeout=5)
-    except:
-        pass
-    os._exit(0)
+    """Отключено. Хард-дедлайн убивал процесс с os._exit(0) — Render не рестартил."""
+    pass
 
 # ─── Watchdog: проверяет что все критические задачи живы ──────────────
 async def watchdog():
     """Каждые 30 секунд проверяет что background-задачи не умерли.
-       Если какая-то умерла — прибиваем процесс, Render перезапустит."""
+       Если какая-то умерла — перезапускает её. Процесс НЕ убивает."""
     if not IS_RENDER:
         return
     tasks_to_monitor = {
-        "heartbeat": None,
-        "self_pinger": None,
-        "auto_restart": None,
-        "hard_deadline": None,
-        "queue_worker": None,
+        "heartbeat": heartbeat,
+        "self_pinger": self_pinger,
+        "queue_worker": queue_worker,
     }
     await asyncio.sleep(10)
     while True:
         await asyncio.sleep(30)
         try:
             all_tasks = asyncio.all_tasks()
-            for name in list(tasks_to_monitor.keys()):
-                found = any(name in str(t) for t in all_tasks)
+            task_strs = [str(t) for t in all_tasks]
+            for name, factory in list(tasks_to_monitor.items()):
+                found = any(name in s for s in task_strs)
                 if not found:
-                    log.error("🔥 Watchdog: задача '%s' не найдена! Перезагрузка.", name)
-                    try:
-                        await asyncio.wait_for(client.disconnect(), timeout=5)
-                    except:
-                        pass
-                    os._exit(1)
+                    log.warning("🔄 Watchdog: задача '%s' умерла, перезапускаю...", name)
+                    asyncio.create_task(factory())
             # Проверяем что queue_worker обновляет heartbeat
             qw_ts = conn.execute("SELECT value FROM config WHERE key='qw_heartbeat'").fetchone()
             if qw_ts:
                 try:
                     last_qw = datetime.fromisoformat(qw_ts[0])
                     if (datetime.now() - last_qw).total_seconds() > 60:
-                        log.error("🔥 Watchdog: queue_worker не отвечал >60с! Перезагрузка.")
-                        try:
-                            await asyncio.wait_for(client.disconnect(), timeout=5)
-                        except:
-                            pass
-                        os._exit(1)
+                        log.warning("🔄 Watchdog: queue_worker не отвечал >60с — перезапускаю задачу")
+                        for t in asyncio.all_tasks():
+                            if "queue_worker" in str(t) and not t.done():
+                                t.cancel()
+                                break
+                        asyncio.create_task(queue_worker())
                 except:
                     pass
         except Exception as e:
@@ -2240,8 +2212,6 @@ async def main():
     # Фоновые задачи (кроме queue_worker — он позже)
     asyncio.create_task(heartbeat())
     asyncio.create_task(self_pinger())
-    asyncio.create_task(auto_restart())
-    asyncio.create_task(hard_deadline())
     asyncio.create_task(watchdog())
     
     # 1. Подключаем user-клиент (нужен для чтения каналов и бэкапа)
