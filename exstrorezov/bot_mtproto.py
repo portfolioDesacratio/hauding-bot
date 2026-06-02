@@ -96,6 +96,47 @@ def text_matches_keywords(text):
                 return True
     return False
 
+# Троллинг‑индикаторы (regex с границами слов, чтобы не цеплять "неба" и т.п.)
+# Текст должен содержать минимум 2 таких паттерна, чтобы пройти
+_TROLLING_COUNT = 2
+_TROLLING_PATTERNS = [
+    re.compile(r'\bхуй'), re.compile(r'\bхуя'), re.compile(r'\bхуе'), re.compile(r'\bхую'),
+    re.compile(r'\bхуем'), re.compile(r'\bхуище'), re.compile(r'\bхуё'), re.compile(r'\bхуйня'),
+    re.compile(r'\bпизд'), re.compile(r'\bпиздец'),
+    re.compile(r'\bжоп'), re.compile(r'\bочко'),
+    re.compile(r'\bчлен'), re.compile(r'\bчленом'), re.compile(r'\bчленовый'),
+    re.compile(r'\bшлюх'),
+    re.compile(r'\bпедик'), re.compile(r'\bпедераст'), re.compile(r'\bпидор'),
+    re.compile(r'\bсосал'), re.compile(r'\bсосешь'), re.compile(r'\bсосёт'), re.compile(r'\bотсос'),
+    re.compile(r'\bдроч'), re.compile(r'\bнадрач'),
+    re.compile(r'\bзалуп'), re.compile(r'\bзалупа'),
+    re.compile(r'\bтерпил'), re.compile(r'\bтерпилойд'),
+    re.compile(r'\bочкошник'),
+    re.compile(r'\bгей'), re.compile(r'\bгомосек'),
+    re.compile(r'\bкал\b'), re.compile(r'\bговно'), re.compile(r'\bдерьмо'),
+    re.compile(r'\bминет'),
+    re.compile(r'\bчленосос'),
+    re.compile(r'\bеба'),        # ебать, ебал, ебали, ебала — НО не "неба", "хлеба" (там нет \b перед е)
+    re.compile(r'\bебу'),        # ебу, ебут
+    re.compile(r'\bебё'),        # ебёшь, ебёт, ебём, ебёте
+    re.compile(r'\bёб'),         # ёбаный, заёб
+    re.compile(r'\bвыеб'),       # выебал, выебать
+    re.compile(r'\bзаеб'),       # заебал, заебать
+    re.compile(r'\bнаеб'),       # наебал, наебать
+    re.compile(r'\bподъеб'),     # подъебал
+]
+
+def has_trolling_content(text):
+    """Проверяет, содержит ли текст достаточно троллинг-лексики (минимум _TROLLING_COUNT совпадений)"""
+    text_lower = text.lower()
+    count = 0
+    for pat in _TROLLING_PATTERNS:
+        if pat.search(text_lower):
+            count += 1
+            if count >= _TROLLING_COUNT:
+                return True
+    return False
+
 # Фразы, которые содержат ключевые слова, но НЕ должны триггерить совпадение
 _keyword_blocked = [
     "мумий тролль",      # группа, магазин, музыка
@@ -117,6 +158,11 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
         log.debug("⏭️ Пропущен текст (нет ключевых слов): %d слов из %s", wc(content), chat_title)
         return False
     
+    # Фильтр троллинг-лексики: текст должен содержать минимум N матерных/агрессивных слов
+    if not has_trolling_content(content):
+        log.debug("⏭️ Пропущен текст (нет троллинг-лексики): %d слов из %s", wc(content), chat_title)
+        return False
+
     # Дедупликация: одинаковый текст сохраняем максимум MAX_TEXT_DUPLICATES раз
     # На 3й раз текст БЛОКИРУЕТСЯ навсегда — banned=1, никогда не пройдёт
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
