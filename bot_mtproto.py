@@ -163,8 +163,7 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
         log.debug("⏭️ Пропущен текст (нет троллинг-лексики): %d слов из %s", wc(content), chat_title)
         return False
     
-    # Проверка: это сообщение (chat_id + msg_id) уже сохранено? Тогда пропускаем.
-    # Это предотвращает дубли when on_msg И scrape_channel обрабатывают одно и то же сообщение.
+    # 1) Проверка: это сообщение (chat_id + msg_id) уже сохранено?
     if chat_id != "?" and msg_id is not None:
         existing = conn.execute(
             "SELECT 1 FROM texts WHERE source_chat=? AND source_message_id=?",
@@ -174,30 +173,23 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
             log.debug("⏭️ Сообщение уже сохранено: %s msg#%s из %s", chat_id, msg_id, chat_title)
             return False
     
-    # Дедупликация: одинаковый текст сохраняем максимум MAX_TEXT_DUPLICATES раз
-    # На 3й раз текст БЛОКИРУЕТСЯ навсегда — banned=1, никогда не пройдёт
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    row = conn.execute("SELECT count, banned FROM text_hashes WHERE hash=?", (content_hash,)).fetchone()
-    if row:
-        if row[1] == 1:
-            log.debug("⏭️ Дубликат ЗАБАНЕН: %d слов из %s", wc(content), chat_title)
-            return False
-        if row[0] >= MAX_TEXT_DUPLICATES:
-            # Третий раз — бан навсегда
-            conn.execute("UPDATE text_hashes SET banned=1 WHERE hash=?", (content_hash,))
-            conn.commit()
-            log.warning("🚫 Текст ЗАБАНЕН (3й дубликат): %d слов из %s", wc(content), chat_title)
-            return False
-        conn.execute("UPDATE text_hashes SET count=count+1 WHERE hash=?", (content_hash,))
-        dup_num = row[0] + 1
-    else:
-        conn.execute("INSERT INTO text_hashes (hash,count) VALUES (?,1)", (content_hash,))
-        dup_num = 1
+    # 2) Дедупликация по содержимому: считаем сколько РАЗ этот текст УЖЕ в БД
+    #    (не по хешу, а напрямую — хеш может сброситься при краше)
+    current_count = conn.execute(
+        "SELECT COUNT(*) FROM texts WHERE content=?",
+        (content,)
+    ).fetchone()[0]
+    if current_count >= MAX_TEXT_DUPLICATES:
+        log.warning("🚫 Дубликат (в БД уже %d копий): %d слов из %s",
+                    current_count, wc(content), chat_title)
+        return False
     
+    # 3) Сохраняем (INSERT OR IGNORE — защита от race condition через UNIQUE индекс)
     words = wc(content)
     conn.execute("INSERT OR IGNORE INTO texts (content,source_chat,source_chat_title,source_message_id,source_link,word_count) VALUES (?,?,?,?,?,?)",
                  (content, chat_id, chat_title, msg_id, link, words))
     conn.commit()
+    
     # Проверяем, реально ли вставилась строка (INSERT OR IGNORE мог не вставить)
     actually_saved = conn.execute(
         "SELECT 1 FROM texts WHERE source_chat=? AND source_message_id=?",
@@ -206,7 +198,9 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
     if not actually_saved:
         log.debug("⏭️ INSERT OR IGNORE не вставил (уже есть): %s msg#%s", chat_id, msg_id)
         return False
-    log.info("💾 %d слов из %s | канал #%s (дубль %d/%d)", words, chat_title, chat_id, dup_num, MAX_TEXT_DUPLICATES)
+    
+    log.info("💾 %d слов из %s | канал #%s (всего копий в БД: %d/%d)",
+             words, chat_title, chat_id, current_count + 1, MAX_TEXT_DUPLICATES)
     return True
 
 session_path = str(DATA_DIR / "mt_session")
