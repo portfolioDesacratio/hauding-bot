@@ -300,15 +300,24 @@ async def restore_settings_from_backup():
             log.info("📦 Настройки восстановлены из бэкапа в канале %s", target)
             return True
     
-    # Если в канале не нашли, пробуем в личке владельца
+    # Если в канале не нашли, пробуем в личке владельца (через юзернейм бота)
     log.info("📦 Бэкап в канале не найден, ищу в личке владельца...")
     try:
-        async for msg in uc.iter_messages(OWNER_ID, limit=50):
+        # Используем юзернейм бота, чтобы user client прочитал свою переписку с ботом
+        bot_entity = await client.get_me()
+        bot_username = bot_entity.username or bot_entity.id
+        async for msg in uc.iter_messages(bot_username, limit=50):
             if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Thesaurus"):
                 conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", (BACKUP_MSG_ID_KEY, str(msg.id)))
                 conn.commit()
                 if _parse_backup_lines(msg.text):
                     log.info("📦 Настройки восстановлены из бэкапа в личке (msg_id=%s)", msg.id)
+                    return True
+        # Если не нашли по юзернейму бота, пробуем как fallback диалог с самим собой (Saved Messages)
+        async for msg in uc.iter_messages("me", limit=50):
+            if msg and msg.text and msg.text.startswith("📦 Бэкап настроек Thesaurus"):
+                if _parse_backup_lines(msg.text):
+                    log.info("📦 Настройки восстановлены из Saved Messages (msg_id=%s)", msg.id)
                     return True
     except Exception as e:
         log.warning("Не удалось прочитать бэкап из лички: %s", e)
@@ -510,8 +519,14 @@ async def on_msg(event):
             log.debug("⏭️ Пропущен исключённый канал: @%s", chat_username)
             return
         # Фильтр спама от @A_ToolsX и подобных
-        if msg.text and ("A_ToolsX" in msg.text or "To use this bot, you must join our channel" in msg.text):
+        if msg.text and ("A_ToolsX" in msg.text or "To use this bot, you must join our channel" in msg.text or "a_toolsx" in msg.text.lower()):
             log.debug("⏭️ Пропущен спам: %s", msg.text[:80])
+            return
+        # Фильтр по отправителю
+        sender = await event.get_sender()
+        sender_username = getattr(sender, 'username', '').lower() if sender else ''
+        if sender_username in ('a_toolsx',):
+            log.debug("⏭️ Пропущено от @%s", sender_username)
             return
         # Пропускаем канал вывода
         out_ch = get_output_chat()
