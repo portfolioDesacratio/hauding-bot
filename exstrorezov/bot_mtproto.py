@@ -1552,28 +1552,49 @@ async def cmd_auth(event):
         "/phone +79876543210\n\n"
         f"{'👉 У тебя уже сохранён: ' + phone[0] if phone else ''}")
 
+_phone_last_call = 0.0  # защита от спама /phone
+
 async def cmd_phone(event):
     if not is_owner(event): return
     phone = event.pattern_match.group(1).strip()
+    
+    # Защита от повторного /phone (не чаще раза в 90 секунд)
+    global _phone_last_call
+    now = time.time()
+    if now - _phone_last_call < 90:
+        remaining = int(90 - (now - _phone_last_call))
+        await safe_send(event.chat_id, f"⏳ Подожди {remaining}с перед повторным запросом кода")
+        return
+    _phone_last_call = now
+    
     conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("user_phone", phone))
     conn.commit()
     uc = get_user_client()
     await uc.connect()
     try:
-        await uc.send_code_request(phone)
+        result = await safe_api_call(uc, "send_code_request", phone, min_delay=1.0)
+        # result — это SentCode, у которого есть атрибут type
+        phone_register = getattr(result, 'phone_registered', True)
+        code_type = str(type(result.type).__name__) if hasattr(result, 'type') else "?"
+        # Пробуем понять, как отправлен код
+        delivery = "через Telegram (служебное сообщение)"
+        type_name = getattr(result.type, 'class_name', '') if hasattr(result, 'type') else ''
+        if 'sms' in type_name.lower() or 'Sms' in type_name:
+            delivery = "по SMS"
+        
         # Активируем режим сбора цифр по одной
         conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("auth_digit_active", "1"))
         conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)", ("auth_digits", ""))
         conn.commit()
+        
         await safe_send(event.chat_id,
-            f"✅ Код отправлен на {phone}\n\n"
-            "Ввести можно двумя способами:\n"
-            "1️⃣ /code 12345 — одним сообщением\n"
-            "2️⃣ Отправить 5 сообщений по одной цифре:\n"
+            f"✅ Код отправлен {delivery} на {phone}\n\n"
+            "1️⃣ Введи код: /code XXXXX\n"
+            "2️⃣ Или по одной цифре (5 сообщений):\n"
             "1\n2\n3\n4\n5\n\n"
-            "Если ошиблись — /phone +7... ещё раз")
+            "⚠️ НЕ отправляй /phone повторно — это убьёт код!")
     except errors.FloodWaitError as e:
-        await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, попробуй позже.")
+        await safe_send(event.chat_id, f"⏳ FloodWait {e.seconds}с, жди.")
     except Exception as e:
         await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
 
