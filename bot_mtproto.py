@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from telethon import TelegramClient, errors, events, functions
 
-MAX_TEXT_DUPLICATES = 2  # макс повторов одного текста — при 3м разе блокируется навсегда
+MAX_TEXT_DUPLICATES = 1  # макс повторов одного текста — 1 раз и навсегда
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
