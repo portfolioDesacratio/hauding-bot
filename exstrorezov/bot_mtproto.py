@@ -247,7 +247,7 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
 
 # ─── Persistent pause state (переживает рестарты и редеплои через SQLite) ──
 def _load_pause_state():
-    """Читает состояние паузы из БД и устанавливает _scanning"""
+    """Читает состояние паузы из БД (информационно). Стартуем всегда с паузой - _scanning = False."""
     global _scanning
     row = conn.execute("SELECT value FROM config WHERE key='paused'").fetchone()
     if row:
@@ -378,7 +378,7 @@ async def _delete_checkpoint(chat_id, msg_id):
 session_path = str(DATA_DIR / "mt_session")
 client = TelegramClient(session_path, API_ID, API_HASH)
 RE_LINK = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_+\-]{3,})')
-_scanning = True
+_scanning = False  # после любого рестарта/редеплоя — пауза (force=True для файлов владельца)
 
 # ─── Бэкап настроек в Telegram (чтобы не слетало после редеплоя) ──
 BACKUP_MSG_ID_KEY = "backup_msg_id"
@@ -1525,7 +1525,7 @@ async def cmd_pause(event):
         if not is_owner(event): return
         global _scanning; _scanning = False
         _save_pause_state(True)
-        await safe_send(event.chat_id, "⏸ Пауза сохранена. После рестарта останется.")
+        await safe_send(event.chat_id, "⏸ Пауза.")
     except Exception as e:
         log.exception("cmd_pause: %s", e)
 
@@ -2579,103 +2579,142 @@ async def cmd_restore_session(event):
 
 # ─── Главный запуск ──────────────────────────────────────────────────
 async def main():
-    # Здоровье ДО старта клиента
+    # Здоровье ДО старта клиента (живёт весь процесс, независимо от цикла)
     if IS_RENDER:
         asyncio.create_task(health_server())
 
-    # Стартуем с retry при FloodWait (бывает после частых редеплоев)
-    for attempt in range(10):
-        try:
-            await client.start(bot_token=BOT_TOKEN)
-            break
-        except errors.FloodWaitError as e:
-            wait = min(e.seconds, 300)
-            log.warning("⏳ FloodWait при входе: %dс (попытка %d/10, жду %dс)", e.seconds, attempt + 1, wait)
-            await asyncio.sleep(wait)
-    else:
-        log.error("❌ Не удалось войти после 10 попыток")
-        return
-    # Регистрируем хендлеры ПОСЛЕ старта
-    register_handlers()
+    CYCLE_MINUTES = 5  # полная перезагрузка соединения каждые 5 минут
 
-    me = await client.get_me()
-    log.info("=" * 50)
-    log.info("🤖 @%s запущен", me.username or "?")
-    log.info("📁 База: %s", DB_PATH)
-    if IS_RENDER:
-        log.info("🌐 Render: %s | Health check на порту %d", RENDER_URL or "?", PORT)
-    else:
-        log.info("🖥 Локальный режим")
-    log.info("=" * 50)
-
-    # Фоновые задачи (кроме queue_worker — он позже)
-    asyncio.create_task(heartbeat())
-    asyncio.create_task(self_pinger())
-    asyncio.create_task(watchdog())
-    
-    # 1. Подключаем user-клиент (нужен для чтения каналов и бэкапа)
-    user_ok = await init_user_client()
-    if user_ok:
-        log.info("👤 User-клиент готов")
-    else:
-        log.warning("👤 User-клиент НЕ готов — каналы не будут читаться до /auth")
-    
-    # 2. Восстанавливаем настройки из бэкапа (через user-клиент)
-    texts_count = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
-    if texts_count == 0 and not get_output_chat():
-        log.info("📦 База пуста, пробую восстановить из бэкапа Telegram...")
-        restored = await restore_settings_from_backup()
-        if restored:
-            log.info("📦 Настройки восстановлены из бэкапа!")
+    while True:
+        # ── Подключение к Telegram ─────────────────────────────────
+        for attempt in range(10):
+            try:
+                # Если клиент уже был подключён (повторный цикл), отключаемся чисто
+                if client.is_connected():
+                    await client.disconnect()
+                await asyncio.sleep(1)
+                await client.start(bot_token=BOT_TOKEN)
+                break
+            except errors.FloodWaitError as e:
+                wait = min(e.seconds, 300)
+                log.warning("⏳ FloodWait при входе: %dс (попытка %d/10, жду %dс)", e.seconds, attempt + 1, wait)
+                await asyncio.sleep(wait)
         else:
-            log.info("📦 Бэкап не найден, всё придётся настроить заново")
-    
-    # 3️⃣ Сканируем канал вывода — строим Telegram-based dedup (переживает пересоздание инстанса)
-    await _load_sent_hashes()
-    
-    # 4️⃣ Seed-каналы добавляем всегда (INSERT OR IGNORE — дубликаты безопасны)
-    await add_seed_channels()
-    # Сбрасываем error-каналы обратно в pending (чтобы перезапустились с новым лимитом)
-    reset = conn.execute(
-        "UPDATE scrape_queue SET status='pending', error=NULL WHERE status='error'"
-    ).rowcount
-    if reset:
-        conn.commit()
-        log.info("🔄 Сброшено %d error-каналов в pending", reset)
-    # Persistent-каналы добавляем в любом случае
-    await add_persistent_to_queue()
-    
-    # 5️⃣ Шлём уведомление владельцу с актуальным состоянием
-    restored_settings = []
-    out_ch = get_output_chat()
-    if out_ch: restored_settings.append(f"📤 Канал вывода: {out_ch}")
-    kw = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
-    if kw: restored_settings.append(f"🔍 Ключевые слова: {kw[0][:60]}...")
-    auto = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
-    if auto: restored_settings.append(f"🔄 Автопоиск: {auto[0]}")
-    pers = get_persistent_channels()
-    if pers: restored_settings.append(f"📌 Persistent: {len(pers)} каналов")
-    texts_count = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
-    restored_settings.append(f"📚 Текстов в базе: {texts_count}")
-    restored_settings.append(f"🔐 Telegram dedup: {len(_SENT_HASHES)} хэшей загружено")
-    startup_msg = "🔄 <b>Бот перезапущен</b>\n" + "\n".join(f"• {s}" for s in restored_settings)
-    try:
-        await notify_owners(startup_msg)
-    except:
-        pass
-    
-    # 6️⃣ Загружаем сохранённое состояние паузы из БД
-    _load_pause_state()
-    scanning_status = "⏸ пауза" if not _scanning else "▶️ активен"
-    log.info("📌 Состояние сканирования: %s", scanning_status)
-    
-    # 7️⃣ Возобновляем отправку файла, если была прервана
-    asyncio.create_task(_resume_file_streaming())
-    
-    # 8️⃣ Queue worker запускаем ПОСЛЕ того, как всё готово
-    asyncio.create_task(queue_worker())
+            log.error("❌ Не удалось войти после 10 попыток, жду 60с и пробую снова...")
+            await asyncio.sleep(60)
+            continue
 
-    await client.run_until_disconnected()
+        # ── Регистрируем хендлеры (сначала чистим старые) ──────────
+        if hasattr(client, '_event_builders'):
+            client._event_builders.clear()
+        register_handlers()
+
+        me = await client.get_me()
+        log.info("=" * 50)
+        log.info("🤖 @%s запущен (цикл %d мин)", me.username or "?", CYCLE_MINUTES)
+        log.info("📁 База: %s", DB_PATH)
+        if IS_RENDER:
+            log.info("🌐 Render: %s | Health check на порту %d", RENDER_URL or "?", PORT)
+        else:
+            log.info("🖥 Локальный режим")
+        log.info("=" * 50)
+
+        # ── Фоновые задачи ─────────────────────────────────────────
+        bg_tasks = [
+            asyncio.create_task(heartbeat()),
+            asyncio.create_task(self_pinger()),
+            asyncio.create_task(watchdog()),
+        ]
+
+        # 1. User-клиент
+        user_ok = await init_user_client()
+        if user_ok:
+            log.info("👤 User-клиент готов")
+        else:
+            log.warning("👤 User-клиент НЕ готов — каналы не будут читаться до /auth")
+
+        # 2. Восстановление настроек из бэкапа
+        texts_count = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
+        if texts_count == 0 and not get_output_chat():
+            log.info("📦 База пуста, пробую восстановить из бэкапа Telegram...")
+            restored = await restore_settings_from_backup()
+            if restored:
+                log.info("📦 Настройки восстановлены из бэкапа!")
+            else:
+                log.info("📦 Бэкап не найден, всё придётся настроить заново")
+
+        # 3. Telegram-based dedup
+        await _load_sent_hashes()
+
+        # 4. Seed-каналы
+        await add_seed_channels()
+        reset = conn.execute(
+            "UPDATE scrape_queue SET status='pending', error=NULL WHERE status='error'"
+        ).rowcount
+        if reset:
+            conn.commit()
+            log.info("🔄 Сброшено %d error-каналов в pending", reset)
+        await add_persistent_to_queue()
+
+        # 5. После рестарта — всегда пауза. Возобновляем отправку файла, если прервана.
+        _scanning = False
+        log.info("📌 Состояние: ⏸ пауза (после рестарта)")
+        asyncio.create_task(_resume_file_streaming())
+
+        # 6. Queue worker
+        qw_task = asyncio.create_task(queue_worker())
+
+        # 7. Уведомление владельцам
+        restored_settings = []
+        out_ch = get_output_chat()
+        if out_ch: restored_settings.append(f"📤 Канал вывода: {out_ch}")
+        kw = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
+        if kw: restored_settings.append(f"🔍 Ключевые слова: {kw[0][:60]}...")
+        auto = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
+        if auto: restored_settings.append(f"🔄 Автопоиск: {auto[0]}")
+        pers = get_persistent_channels()
+        if pers: restored_settings.append(f"📌 Persistent: {len(pers)} каналов")
+        texts_count = conn.execute("SELECT COUNT(*) FROM texts").fetchone()[0]
+        restored_settings.append(f"📚 Текстов в базе: {texts_count}")
+        restored_settings.append(f"🔐 Telegram dedup: {len(_SENT_HASHES)} хэшей")
+        startup_msg = "🔄 <b>Бот перезапущен</b>\n" + "\n".join(f"• {s}" for s in restored_settings)
+        try:
+            await notify_owners(startup_msg)
+        except:
+            pass
+
+        # ── Таймер плановой перезагрузки (disconnect через N минут) ──
+        async def _auto_disconnect():
+            await asyncio.sleep(CYCLE_MINUTES * 60)
+            log.info("🔄 Плановая перезагрузка соединения (каждые %d мин)...", CYCLE_MINUTES)
+            # Сохраняем текущее состояние
+            _save_pause_state(not _scanning)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+        asyncio.create_task(_auto_disconnect())
+
+        # ── Ждём отключения (по таймеру или ошибке) ────────────────
+        try:
+            await client.run_until_disconnected()
+        except Exception as e:
+            log.warning("⚠️ run_until_disconnected завершился: %s", str(e)[:100])
+
+        # ── Очистка перед следующим циклом ─────────────────────────
+        log.info("🔄 Завершаю задачи цикла...")
+        qw_task.cancel()
+        for t in bg_tasks:
+            t.cancel()
+        # Сбрасываем сессионные кеши (они будут перестроены при реконнекте)
+        _SENT_HASHES.clear()
+        _sess_dup.clear()
+        conn.execute("DELETE FROM file_progress WHERE active=1 AND words_sent > 0")
+        conn.commit()
+
+        log.info("🔄 Ожидание 5с перед переподключением...")
+        await asyncio.sleep(5)
 
 if __name__ == "__main__":
     try:
