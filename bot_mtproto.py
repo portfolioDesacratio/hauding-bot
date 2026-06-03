@@ -583,10 +583,13 @@ async def _load_sent_hashes():
 _last_send_time = 0.0
 _send_lock = asyncio.Lock()
 
-async def send_to_output(text, source_title=None, source_link=None):
+async def send_to_output(text, source_title=None, source_link=None, force=False):
     global _last_send_time, _SENT_HASHES
     out = get_output_chat()
     if not out: return
+    if not _scanning and not force:
+        log.debug("⏸ Пауза: send_to_output пропущен (force=%s)", force)
+        return
 
     text_clean = text.replace("<", "&lt;").replace(">", "&gt;")
     message = text_clean
@@ -641,7 +644,7 @@ def _clean_broadcast_text(text: str) -> str:
     text = re.sub(r' +', ' ', text).strip()
     return text
 
-async def broadcast_file(text, filename, event):
+async def broadcast_file(text, filename, event, force=True):
     """Разбивает текст на части по ~600 слов и отправляет в канал с интервалом ~4с"""
     global _last_send_time
     
@@ -664,8 +667,8 @@ async def broadcast_file(text, filename, event):
         return
     
     if total_chunks == 1:
-        # Одна часть — через обычный send (с rate limit)
-        await send_to_output(text, filename)
+        # Одна часть — через обычный send (с rate limit, force=True — файлы всегда)
+        await send_to_output(text, filename, force=force)
         await safe_send(event.chat_id, f"✅ {filename} ({total} слов) отправлен.")
         return
     
@@ -755,12 +758,16 @@ async def on_msg(event):
         
         log.info("📩 Сообщение от %s: «%s»", title, (msg.text or "")[:120])
 
-        # Сохраняем и отправляем текст ≥50 слов
-        if msg.text and wc(msg.text) >= MIN_WORDS:
-            link = f"https://t.me/{chat.username}/{msg.id}" if getattr(chat, "username", None) else None
-            if save_text(msg.text, title, str(chat.id), msg.id, link):
-                log.info("📤 on_msg → send_to_output: %s msg#%s из %s", chat.id, msg.id, title)
-                await send_to_output(msg.text, title, link)
+        # При паузе НЕ обрабатываем текстовые сообщения (только .txt файлы)
+        if not _scanning:
+            log.debug("⏸ Пауза: текстовое сообщение из %s пропущено", title)
+        else:
+            # Сохраняем и отправляем текст ≥50 слов
+            if msg.text and wc(msg.text) >= MIN_WORDS:
+                link = f"https://t.me/{chat.username}/{msg.id}" if getattr(chat, "username", None) else None
+                if save_text(msg.text, title, str(chat.id), msg.id, link):
+                    log.info("📤 on_msg → send_to_output: %s msg#%s из %s", chat.id, msg.id, title)
+                    await send_to_output(msg.text, title, link)
 
         # Ищем ссылки на каналы
         if msg.text:
@@ -805,11 +812,11 @@ async def on_msg(event):
                 if event.is_private and is_owner(event):
                     await broadcast_file(text_content, fn, event)
                 else:
-                    # Старое поведение: абзацы в базу
+                    # Старое поведение: абзацы в базу (force=True — файлы всегда)
                     for b in re.split(r'\n\s*\n', text_content):
                         if wc(b) >= MIN_WORDS:
                             if save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
-                                await send_to_output(b.strip(), title, f"file:{fn}")
+                                await send_to_output(b.strip(), title, f"file:{fn}", force=True)
             except Exception as e:
                 log.error("Файл: %s", e)
                 if event.is_private and is_owner(event):
