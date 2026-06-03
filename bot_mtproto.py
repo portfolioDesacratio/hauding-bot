@@ -58,6 +58,20 @@ conn.execute("""CREATE TABLE IF NOT EXISTS config (
 # Таблица для подсчёта дубликатов текстов (ключ — sha256 content)
 conn.execute("""CREATE TABLE IF NOT EXISTS text_hashes (
     hash TEXT PRIMARY KEY, count INTEGER DEFAULT 1, banned INTEGER DEFAULT 0)""")
+# Таблица для отслеживания прогресса отправки больших файлов (переживает рестарт)
+conn.execute("""CREATE TABLE IF NOT EXISTS file_progress (
+    chat_id INTEGER NOT NULL,
+    msg_id INTEGER NOT NULL,
+    filename TEXT,
+    total_words INTEGER DEFAULT 0,
+    words_sent INTEGER DEFAULT 0,
+    total_chunks INTEGER DEFAULT 0,
+    chunks_sent INTEGER DEFAULT 0,
+    file_size INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 1,
+    checkpoint_msg_id INTEGER,
+    updated_at REAL,
+    PRIMARY KEY (chat_id, msg_id))""")
 conn.commit()
 
 def wc(text): return len(text.split())
@@ -231,6 +245,136 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
              words, chat_title, chat_id, msg_id,
              _sess_dup[ch], db_count + 1, MAX_TEXT_DUPLICATES)
     return True
+
+# ─── Persistent pause state (переживает рестарты и редеплои через SQLite) ──
+def _load_pause_state():
+    """Читает состояние паузы из БД и устанавливает _scanning"""
+    global _scanning
+    row = conn.execute("SELECT value FROM config WHERE key='paused'").fetchone()
+    if row:
+        _scanning = row[0] != '1'
+        log.info("⏸ Загружено состояние паузы из БД: scanning=%s", _scanning)
+
+def _save_pause_state(paused):
+    """Сохраняет состояние паузы в БД"""
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",
+                 ('paused', '1' if paused else '0'))
+    conn.commit()
+
+# ─── File progress tracking (для возобновления отправки файлов после перезапуска) ──
+def _get_active_file_progress():
+    """Возвращает активный прогресс отправки файла или None"""
+    row = conn.execute(
+        "SELECT chat_id, msg_id, filename, total_words, words_sent, "
+        "total_chunks, chunks_sent, file_size, checkpoint_msg_id "
+        "FROM file_progress WHERE active=1 ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        'chat_id': row[0], 'msg_id': row[1], 'filename': row[2],
+        'total_words': row[3], 'words_sent': row[4],
+        'total_chunks': row[5], 'chunks_sent': row[6],
+        'file_size': row[7], 'checkpoint_msg_id': row[8]
+    }
+
+def _save_file_progress(chat_id, msg_id, filename, total_words, words_sent,
+                         total_chunks, chunks_sent, file_size,
+                         checkpoint_msg_id=None):
+    conn.execute("""INSERT OR REPLACE INTO file_progress 
+        (chat_id, msg_id, filename, total_words, words_sent,
+         total_chunks, chunks_sent, file_size, active, checkpoint_msg_id, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,1,?,?)""",
+        (chat_id, msg_id, filename, total_words, words_sent,
+         total_chunks, chunks_sent, file_size,
+         checkpoint_msg_id, time.time()))
+    conn.commit()
+
+def _mark_file_progress_done(chat_id, msg_id):
+    conn.execute("UPDATE file_progress SET active=0, words_sent=total_words "
+                 "WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+    conn.commit()
+
+# ─── Telegram checkpoint для файлового прогресса (переживает редеплой) ──
+_FP_PREFIX = "__FPROGRESS__\n"
+
+def _build_checkpoint_text(chat_id, msg_id, filename, file_size, total_words, words_sent, active=True):
+    return (
+        f"{_FP_PREFIX}"
+        f"chat_id: {chat_id}\n"
+        f"msg_id: {msg_id}\n"
+        f"filename: {filename}\n"
+        f"file_size: {file_size}\n"
+        f"total_words: {total_words}\n"
+        f"words_sent: {words_sent}\n"
+        f"active: {'1' if active else '0'}\n"
+    )
+
+def _parse_checkpoint_text(text):
+    """Парсит чекпойнт из Telegram сообщения, возвращает dict или None"""
+    if not text or not text.startswith(_FP_PREFIX):
+        return None
+    data = {}
+    for line in text.split("\n"):
+        if line.startswith("chat_id:"):
+            data['chat_id'] = int(line.split(":", 1)[1].strip())
+        elif line.startswith("msg_id:"):
+            data['msg_id'] = int(line.split(":", 1)[1].strip())
+        elif line.startswith("filename:"):
+            data['filename'] = line.split(":", 1)[1].strip()
+        elif line.startswith("file_size:"):
+            data['file_size'] = int(line.split(":", 1)[1].strip())
+        elif line.startswith("total_words:"):
+            data['total_words'] = int(line.split(":", 1)[1].strip())
+        elif line.startswith("words_sent:"):
+            data['words_sent'] = int(line.split(":", 1)[1].strip())
+        elif line.startswith("active:"):
+            data['active'] = line.split(":", 1)[1].strip() == '1'
+    if 'active' in data and data['active'] and 'chat_id' in data and 'msg_id' in data:
+        return data
+    return None
+
+async def _send_checkpoint(data):
+    """Отправляет или обновляет чекпойнт в ЛС владельцу"""
+    try:
+        text = _build_checkpoint_text(
+            data['chat_id'], data['msg_id'], data['filename'],
+            data['file_size'], data['total_words'], data['words_sent'],
+            active=True
+        )
+        old_id = data.get('checkpoint_msg_id')
+        if old_id:
+            try:
+                await client.edit_message(data['chat_id'], old_id, text)
+                return old_id
+            except Exception:
+                pass  # не смогли отредактировать — шлём новое
+        msg = await client.send_message(data['chat_id'], text)
+        return msg.id
+    except Exception as e:
+        log.warning("Не удалось отправить чекпойнт: %s", e)
+        return None
+
+async def _find_latest_checkpoint(owner_id):
+    """Сканирует ЛС владельца в поисках последнего чекпойнта __FPROGRESS__"""
+    try:
+        async for msg in client.iter_messages(owner_id, limit=200):
+            if msg and msg.text and msg.text.startswith(_FP_PREFIX):
+                data = _parse_checkpoint_text(msg.text)
+                if data:
+                    data['checkpoint_msg_id'] = msg.id
+                    return data
+    except Exception as e:
+        log.warning("Не удалось найти чекпойнт в ЛС: %s", e)
+    return None
+
+async def _delete_checkpoint(chat_id, msg_id):
+    """Удаляет сообщение-чекпойнт"""
+    if msg_id:
+        try:
+            await client.delete_messages(chat_id, msg_id)
+        except Exception:
+            pass
 
 session_path = str(DATA_DIR / "mt_session")
 client = TelegramClient(session_path, API_ID, API_HASH)
@@ -721,6 +865,215 @@ async def safe_send(chat_id, text, parse_mode="html"):
     except Exception as e:
         log.warning("Не отправилось: %s", e)
 
+# ─── Стриминг большого .txt файла с возможностью докачки ─────────────────
+async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title, fn, is_owner_dm, words_to_skip=0):
+    """Стримит большой .txt файл через iter_download, с поддержкой resume.
+       words_to_skip — сколько слов пропустить (для возобновления после рестарта).
+       Возвращает (total_chunks_sent, total_words_sent)."""
+    doc = msg.document if msg.document else (msg.media.document if msg.media and hasattr(msg.media, 'document') else None)
+    if not doc:
+        return 0, 0
+
+    CHUNK_WORDS = 600
+    word_buffer = []
+    total_chunks = 0
+    total_words = 0
+    skipped = 0
+    chunk_buf = b''
+    report_time = time.time()
+    bytes_downloaded = 0
+    checkpoint_interval = 50  # обновлять чекпойнт в Telegram каждые N чанков
+    last_checkpoint_chunks = 0
+
+    def _decode_chunk(buf):
+        try:
+            return buf.decode('utf-8'), b''
+        except UnicodeDecodeError:
+            for cut in range(len(buf), max(0, len(buf) - 8), -1):
+                try:
+                    return buf[:cut].decode('utf-8'), buf[cut:]
+                except UnicodeDecodeError:
+                    continue
+            return buf.decode('utf-8', errors='replace'), b''
+
+    async def _flush_chunk(force=False):
+        nonlocal word_buffer, total_chunks, total_words, last_checkpoint_chunks
+        text = ' '.join(word_buffer)
+        text = _clean_broadcast_text(text)
+        if not text.strip():
+            word_buffer = []
+            return
+        if is_owner_dm:
+            # Владельцу — без фильтра, сразу отправляем
+            if force or len(word_buffer) >= CHUNK_WORDS:
+                await send_to_output(text, fn, f"file:{fn}", force=True)
+                total_chunks += 1
+                total_words += len(word_buffer)
+                word_buffer = []
+        else:
+            # Не владельцу — с фильтром 50 слов
+            if wc(text) >= MIN_WORDS:
+                if save_text(text.strip(), title, str(chat_id), msg_id, f"file:{fn}"):
+                    await send_to_output(text.strip(), title, f"file:{fn}", force=True)
+                    total_chunks += 1
+                    total_words += len(word_buffer)
+            word_buffer = []
+
+        # Сохраняем прогресс в SQLite (каждые 5 чанков)
+        if total_chunks > 0 and total_chunks % 5 == 0:
+            _save_file_progress(chat_id, msg_id, fn, 0, total_words, 0, total_chunks, file_size)
+
+        # Чекпойнт в Telegram каждые checkpoint_interval чанков
+        if is_owner_dm and total_chunks > 0 and (total_chunks - last_checkpoint_chunks) >= checkpoint_interval:
+            last_checkpoint_chunks = total_chunks
+            cp_data = _get_active_file_progress()
+            if cp_data:
+                cp_data['words_sent'] = total_words
+                cp_msg_id = await _send_checkpoint(cp_data)
+                if cp_msg_id:
+                    conn.execute(
+                        "UPDATE file_progress SET checkpoint_msg_id=? WHERE chat_id=? AND msg_id=?",
+                        (cp_msg_id, chat_id, msg_id)
+                    )
+                    conn.commit()
+
+    # Создаём/обновляем запись прогресса в SQLite
+    _save_file_progress(chat_id, msg_id, fn, 0, 0, 0, 0, file_size)
+
+    # Если есть words_to_skip — отправляем чекпойнт с самого начала
+    if is_owner_dm and words_to_skip > 0:
+        cp_data = _get_active_file_progress()
+        if cp_data:
+            cp_data['words_sent'] = words_to_skip
+            cp_msg_id = await _send_checkpoint(cp_data)
+            if cp_msg_id:
+                conn.execute(
+                    "UPDATE file_progress SET checkpoint_msg_id=? WHERE chat_id=? AND msg_id=?",
+                    (cp_msg_id, chat_id, msg_id)
+                )
+                conn.commit()
+
+    try:
+        async for chunk in client.iter_download(doc, request_size=262144, file_size=file_size):
+            chunk_buf += chunk
+            bytes_downloaded += len(chunk)
+            text, chunk_buf = _decode_chunk(chunk_buf)
+
+            words = text.split()
+            for w in words:
+                # Скипаем слова, если мы в режиме докачки
+                if skipped < words_to_skip:
+                    skipped += 1
+                    continue
+                word_buffer.append(w)
+                if len(word_buffer) >= CHUNK_WORDS:
+                    await _flush_chunk()
+
+            if is_owner_dm and time.time() - report_time > 15:
+                report_time = time.time()
+                pct = min(100, bytes_downloaded * 100 // max(1, file_size))
+                await safe_send(chat_id,
+                    f"⏳ {fn}: {bytes_downloaded//1024//1024}MB / {file_size//1024//1024}MB ({pct}%), "
+                    f"отправлено {total_chunks} чанков ({total_words} слов)")
+
+    except Exception as stream_err:
+        log.exception("Файл %s: ошибка при стриминге: %s", fn, stream_err)
+        if is_owner_dm:
+            await safe_send(chat_id, f"❌ Ошибка при стриминге {fn}: {str(stream_err)[:200]}")
+        # Сохраняем прогресс на случай ошибки
+        _save_file_progress(chat_id, msg_id, fn, 0, total_words, 0, total_chunks, file_size)
+        return total_chunks, total_words
+
+    # Остаток буфера
+    if chunk_buf:
+        text, _ = _decode_chunk(chunk_buf)
+        for w in text.split():
+            if skipped < words_to_skip:
+                skipped += 1
+                continue
+            word_buffer.append(w)
+
+    await _flush_chunk(force=True)
+
+    # Помечаем файл как завершённый
+    _mark_file_progress_done(chat_id, msg_id)
+
+    # Удаляем чекпойнт из Telegram (файл готов)
+    cp = conn.execute(
+        "SELECT checkpoint_msg_id FROM file_progress WHERE chat_id=? AND msg_id=?",
+        (chat_id, msg_id)
+    ).fetchone()
+    if cp and cp[0]:
+        await _delete_checkpoint(chat_id, cp[0])
+
+    if is_owner_dm:
+        await safe_send(chat_id, f"✅ {fn}: {total_chunks} чанков отправлено ({total_words} слов)")
+
+    return total_chunks, total_words
+
+
+async def _resume_file_streaming():
+    """Проверяет, есть ли незавершённая отправка файла, и возобновляет её.
+       Сначала проверяет SQLite, потом Telegram чекпойнты."""
+    fp = _get_active_file_progress()
+    if fp:
+        log.info("📂 Найден активный прогресс файла в SQLite: %s (слов: %d/%d)",
+                 fp['filename'], fp['words_sent'], fp['total_words'])
+    else:
+        # Если SQLite пуст (редеплой) — ищем чекпойнт в ЛС владельца
+        log.info("📂 SQLite пуст, ищу чекпойнт в ЛС владельца...")
+        fp = await _find_latest_checkpoint(OWNER_ID)
+        if fp:
+            log.info("📂 Найден чекпойнт в Telegram: %s (слов: %d/%d)",
+                     fp.get('filename', '?'), fp.get('words_sent', 0), fp.get('total_words', 0))
+            # Восстанавливаем в SQLite
+            _save_file_progress(
+                fp['chat_id'], fp['msg_id'],
+                fp.get('filename', 'unknown.txt'),
+                fp.get('total_words', 0), fp.get('words_sent', 0),
+                0, 0, fp.get('file_size', 0),
+                fp.get('checkpoint_msg_id')
+            )
+        else:
+            log.info("📂 Нет незавершённых файлов")
+            return
+
+    if not fp:
+        return
+
+    # Получаем сообщение с файлом
+    try:
+        file_msgs = await client.get_messages(fp['chat_id'], ids=fp['msg_id'])
+        if not file_msgs or len(file_msgs) == 0:
+            log.warning("📂 Сообщение с файлом #%d удалено или недоступно", fp['msg_id'])
+            _mark_file_progress_done(fp['chat_id'], fp['msg_id'])
+            return
+        file_msg = file_msgs[0]
+    except Exception as e:
+        log.warning("📂 Не удалось получить сообщение с файлом: %s", e)
+        return
+
+    if not file_msg.document:
+        log.warning("📂 Сообщение #%d больше не содержит файла", fp['msg_id'])
+        _mark_file_progress_done(fp['chat_id'], fp['msg_id'])
+        return
+
+    fn = file_msg.file.name or "unknown.txt"
+    file_size = file_msg.file.size or 0
+    is_owner_dm = fp['chat_id'] in OWNER_IDS
+
+    log.info("📂 Возобновляю отправку файла %s с позиции %d слов...",
+             fn, fp['words_sent'])
+
+    await safe_send(fp['chat_id'],
+        f"🔄 Возобновляю отправку файла {fn} ({file_size//1024//1024}MB) с {fp['words_sent']} слов...")
+
+    await _stream_file_from_msg(
+        file_msg, fp['chat_id'], fp['msg_id'], file_size,
+        fn, fn, fn, is_owner_dm,
+        words_to_skip=fp['words_sent']
+    )
+
 # ─── Обработчик всех сообщений ─────────────────────────────────────
 async def on_msg(event):
     try:
@@ -807,174 +1160,16 @@ async def on_msg(event):
                 file_size = msg.file.size if msg.file and msg.file.size else 0
                 is_owner_dm = event.is_private and is_owner(event)
                 
-                # ── Для больших файлов (>50MB) — стримим через iter_download, обрабатываем на лету ──
+                # ── Для больших файлов (>50MB) — стримим через iter_download с поддержкой докачки ──
                 if file_size > 50 * 1024 * 1024:
                     if is_owner_dm:
                         await safe_send(event.chat_id, f"📥 Большой файл ({file_size//1024//1024}MB), стримлю и обрабатываю…")
                     
-                    doc = msg.document if msg.document else (msg.media.document if msg.media and hasattr(msg.media, 'document') else None)
-                    if not doc:
-                        if is_owner_dm:
-                            await safe_send(event.chat_id, "❌ Не удалось получить document для скачивания")
-                        return
-                    
-                    # Для файлов от владельца — шлём всё без фильтра 50 слов, чанками по 600 слов (как broadcast_file)
-                    # Для остальных — с фильтром, каждый абзац отдельно
-                    CHUNK_WORDS = 600
-                    word_buffer = []
-                    total_chunks = 0
-                    total_skipped = 0
-                    chunk_buf = b''
-                    report_time = time.time()
-                    bytes_downloaded = 0
-                    
-                    def _decode_chunk(buf):
-                        try:
-                            return buf.decode('utf-8'), b''
-                        except UnicodeDecodeError:
-                            for cut in range(len(buf), max(0, len(buf) - 8), -1):
-                                try:
-                                    return buf[:cut].decode('utf-8'), buf[cut:]
-                                except UnicodeDecodeError:
-                                    continue
-                            return buf.decode('utf-8', errors='replace'), b''
-                    
-                    async def _flush_chunk(force=False):
-                        nonlocal word_buffer, total_chunks
-                        text = ' '.join(word_buffer)
-                        text = _clean_broadcast_text(text)
-                        if not text.strip():
-                            word_buffer = []
-                            return
-                        if is_owner_dm:
-                            # Владельцу — без фильтра, сразу отправляем
-                            if force or len(word_buffer) >= CHUNK_WORDS:
-                                await send_to_output(text, fn, f"file:{fn}", force=True)
-                                total_chunks += 1
-                                word_buffer = []
-                        else:
-                            # Не владельцу — с фильтром 50 слов
-                            if wc(text) >= MIN_WORDS:
-                                if save_text(text.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
-                                    await send_to_output(text.strip(), title, f"file:{fn}", force=True)
-                                    total_chunks += 1
-                            word_buffer = []
-                    
-                    try:
-                        async for chunk in client.iter_download(doc, request_size=262144, file_size=file_size):
-                            chunk_buf += chunk
-                            bytes_downloaded += len(chunk)
-                            text, chunk_buf = _decode_chunk(chunk_buf)
-                            
-                            # Разбиваем на слова (по пробелам), накапливаем в буфер
-                            words = text.split()
-                            for w in words:
-                                word_buffer.append(w)
-                                if len(word_buffer) >= CHUNK_WORDS:
-                                    await _flush_chunk()
-                            
-                            if is_owner_dm and time.time() - report_time > 15:
-                                report_time = time.time()
-                                pct = min(100, bytes_downloaded * 100 // max(1, file_size))
-                                await safe_send(event.chat_id,
-                                    f"⏳ {fn}: {bytes_downloaded//1024//1024}MB / {file_size//1024//1024}MB ({pct}%), "
-                                    f"отправлено {total_chunks} чанков")
-                    
-                    except Exception as stream_err:
-                        log.exception("Файл %s: ошибка при стриминге: %s", fn, stream_err)
-                        if is_owner_dm:
-                            await safe_send(event.chat_id, f"❌ Ошибка при стриминге {fn}: {str(stream_err)[:200]}")
-                    
-                    # Остаток буфера
-                    if chunk_buf:
-                        text, _ = _decode_chunk(chunk_buf)
-                        for w in text.split():
-                            word_buffer.append(w)
-                    
-                    await _flush_chunk(force=True)
-                    
-                    if is_owner_dm:
-                        await safe_send(event.chat_id, f"✅ {fn}: {total_chunks} чанков отправлено (пропущено {total_skipped})")
-                    return
-                    
-                    async def _send_para(para_text):
-                        nonlocal total_sent
-                        para_text = _clean_broadcast_text(para_text)
-                        if wc(para_text) >= MIN_WORDS:
-                            if is_owner_dm:
-                                await send_to_output(para_text, fn, f"file:{fn}", force=True)
-                            else:
-                                if save_text(para_text.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
-                                    await send_to_output(para_text.strip(), title, f"file:{fn}", force=True)
-                            total_sent += 1
-                    
-                    async def _flush_para(force=False):
-                        nonlocal para_lines
-                        while len(para_lines) >= (200 if force else 500):
-                            await _send_para('\n'.join(para_lines[:200]))
-                            para_lines = para_lines[200:]
-                        if force and para_lines:
-                            await _send_para('\n'.join(para_lines))
-                            para_lines = []
-                    
-                    para_lines = []
-                    total_sent = 0
-                    chunk_buf = b''
-                    report_time = time.time()
-                    bytes_downloaded = 0
-                    
-                    def _decode_chunk(buf):
-                        """Декодирует байтовый буфер в текст, возвращая (текст, остаток_байт)"""
-                        try:
-                            return buf.decode('utf-8'), b''
-                        except UnicodeDecodeError:
-                            # Ищем границу валидного UTF-8 с конца
-                            for cut in range(len(buf), max(0, len(buf) - 8), -1):
-                                try:
-                                    return buf[:cut].decode('utf-8'), buf[cut:]
-                                except UnicodeDecodeError:
-                                    continue
-                            return buf.decode('utf-8', errors='replace'), b''
-                    
-                    try:
-                        async for chunk in client.iter_download(doc, request_size=262144, file_size=file_size):
-                            chunk_buf += chunk
-                            bytes_downloaded += len(chunk)
-                            text, chunk_buf = _decode_chunk(chunk_buf)
-                            
-                            for line in text.split('\n'):
-                                line = line.rstrip('\r')
-                                if line.strip() == '' and para_lines:
-                                    await _flush_para()
-                                elif line.strip() or para_lines:
-                                    para_lines.append(line)
-                            
-                            if is_owner_dm and time.time() - report_time > 15:
-                                report_time = time.time()
-                                pct = min(100, bytes_downloaded * 100 // max(1, file_size))
-                                await safe_send(event.chat_id,
-                                    f"⏳ {fn}: {bytes_downloaded//1024//1024}MB / {file_size//1024//1024}MB ({pct}%), "
-                                    f"отправлено {total_sent} абзацев")
-                    
-                    except Exception as stream_err:
-                        log.exception("Файл %s: ошибка при стриминге: %s", fn, stream_err)
-                        if is_owner_dm:
-                            await safe_send(event.chat_id, f"❌ Ошибка при стриминге {fn}: {str(stream_err)[:200]}")
-                    
-                    # Декодируем и скармливаем остаток
-                    if chunk_buf:
-                        text, _ = _decode_chunk(chunk_buf)
-                        for line in text.split('\n'):
-                            line = line.rstrip('\r')
-                            if line.strip() == '' and para_lines:
-                                await _flush_para()
-                            elif line.strip() or para_lines:
-                                para_lines.append(line)
-                    
-                    await _flush_para(force=True)
-                    
-                    if is_owner_dm:
-                        await safe_send(event.chat_id, f"✅ {fn}: {total_sent} абзацев отправлено")
+                    await _stream_file_from_msg(
+                        msg, event.chat_id, msg.id, file_size,
+                        fn, title, fn, is_owner_dm,
+                        words_to_skip=0
+                    )
                     return
                 
                 # ── Для маленьких файлов (≤50MB) — скачиваем в память ──
@@ -1344,7 +1539,8 @@ async def cmd_pause(event):
     try:
         if not is_owner(event): return
         global _scanning; _scanning = False
-        await safe_send(event.chat_id, "⏸ Пауза.")
+        _save_pause_state(True)
+        await safe_send(event.chat_id, "⏸ Пауза сохранена. После рестарта останется.")
     except Exception as e:
         log.exception("cmd_pause: %s", e)
 
@@ -1352,6 +1548,7 @@ async def cmd_resume(event):
     try:
         if not is_owner(event): return
         global _scanning; _scanning = True
+        _save_pause_state(False)
         await safe_send(event.chat_id, "▶️ Продолжаем.")
     except Exception as e:
         log.exception("cmd_resume: %s", e)
@@ -2482,7 +2679,15 @@ async def main():
     except:
         pass
     
-    # 6️⃣ Queue worker запускаем ПОСЛЕ того, как всё готово
+    # 6️⃣ Загружаем сохранённое состояние паузы из БД
+    _load_pause_state()
+    scanning_status = "⏸ пауза" if not _scanning else "▶️ активен"
+    log.info("📌 Состояние сканирования: %s", scanning_status)
+    
+    # 7️⃣ Возобновляем отправку файла, если была прервана
+    asyncio.create_task(_resume_file_streaming())
+    
+    # 8️⃣ Queue worker запускаем ПОСЛЕ того, как всё готово
     asyncio.create_task(queue_worker())
 
     await client.run_until_disconnected()
