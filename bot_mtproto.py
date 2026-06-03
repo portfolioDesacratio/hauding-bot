@@ -370,18 +370,28 @@ async def _send_checkpoint(data):
         return None
 
 async def _find_latest_checkpoint(owner_id):
-    """Сканирует ЛС владельца в поисках последнего чекпойнта FPROGRESS.
-       Использует user-клиент (uc.iter_messages), потому что bot-клиент
-       может не видеть историю сообщений в ЛС (особенно свои собственные)."""
+    """Сканирует ЛС владельца (переписку с ботом) в поисках последнего чекпойнта FPROGRESS.
+       Использует user-клиент (uc), который должен читать чат с БОТОМ,
+       а не с owner_id (иначе user-клиент читает Saved Messages)."""
     uc = get_user_client()
     if not uc or not uc.is_connected():
         log.warning("📂 User-клиент недоступен — не могу сканировать ЛС")
         return None
 
+    # Получаем юзернейм бота (чтобы user-клиент читал именно ЛС с ботом)
+    try:
+        me_bot = await client.get_me()
+        bot_username = me_bot.username or me_bot.id
+    except Exception as e:
+        log.warning("📂 Не удалось получить юзернейм бота: %s", e)
+        return None
+
+    log.info("📂 Сканирую ЛС с @%s через user-клиент...", bot_username)
+
     # Шаг 1: пробуем search API (может не работать даже для user-клиента)
     try:
         found_search = 0
-        async for msg in uc.iter_messages(owner_id, search="FPROGRESS", limit=20):
+        async for msg in uc.iter_messages(bot_username, search="FPROGRESS", limit=20):
             if not msg or not msg.raw_text:
                 continue
             found_search += 1
@@ -403,7 +413,7 @@ async def _find_latest_checkpoint(owner_id):
     log.info("📂 Fallback: перебор 500 сообщений через user-клиент...")
     try:
         found_fb = 0
-        async for msg in uc.iter_messages(owner_id, limit=500):
+        async for msg in uc.iter_messages(bot_username, limit=500):
             if not msg or not msg.raw_text:
                 continue
             raw = msg.raw_text
