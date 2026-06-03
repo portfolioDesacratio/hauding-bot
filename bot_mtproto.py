@@ -1007,12 +1007,19 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
     # Помечаем файл как завершённый
     _mark_file_progress_done(chat_id, msg_id)
 
-    # Удаляем чекпойнт из Telegram (файл готов)
+    # Обновляем чекпойнт в Telegram: active=0 (чтобы после редеплоя не пытался возобновить)
     cp = conn.execute(
         "SELECT checkpoint_msg_id FROM file_progress WHERE chat_id=? AND msg_id=?",
         (chat_id, msg_id)
     ).fetchone()
     if cp and cp[0]:
+        try:
+            done_text = _build_checkpoint_text(
+                chat_id, msg_id, fn, file_size, total_words, total_words, active=False
+            )
+            await client.edit_message(chat_id, cp[0], done_text)
+        except Exception:
+            pass
         await _delete_checkpoint(chat_id, cp[0])
 
     if is_owner_dm:
