@@ -370,47 +370,49 @@ async def _send_checkpoint(data):
 
 async def _find_latest_checkpoint(owner_id):
     """Сканирует ЛС владельца в поисках последнего чекпойнта FPROGRESS.
-       Использует search= чтобы найти сообщения с FPROGRESS напрямую."""
+       Сначала пробует search API. Если API не дал — fallback на перебор 500 сообщений.
+       search API может не работать для ботов — fallback обязателен."""
+    # Шаг 1: пробуем search API (может не работать для ботов)
     try:
-        # Сначала пробуем найти через search API (самый надёжный способ)
-        found = 0
+        found_search = 0
         async for msg in client.iter_messages(owner_id, search="FPROGRESS", limit=20):
             if not msg or not msg.raw_text:
                 continue
-            found += 1
+            found_search += 1
             raw = msg.raw_text
-            log.info("📂 Найдено сообщение #%d с 'FPROGRESS': первые 200 символов raw_text: %s",
-                     msg.id, raw[:200])
+            log.info("📂 Search: найдено msg #%d с 'FPROGRESS': %s", msg.id, raw[:200])
             data = _parse_checkpoint_text(raw)
             if data:
-                log.info("📂 Чекпойнт #%d: msg_id=%s words_sent=%s active=%s",
-                         found, data.get('msg_id','?'), data.get('words_sent','?'), data.get('active','?'))
+                log.info("📂 Чекпойнт найден через search! words_sent=%s", data.get('words_sent','?'))
                 data['checkpoint_msg_id'] = msg.id
                 return data
-            else:
-                log.info("📂 _parse_checkpoint_text вернул None для msg #%d (raw_text первых 300: %s)",
-                         msg.id, raw[:300])
-        log.info("📂 _find_latest_checkpoint: найдено сообщений с 'FPROGRESS': %d", found)
-
-        # Если search не нашёл — пробуем прямой перебор (fallback)
-        if found == 0:
-            log.info("📂 Fallback: прямой перебор 500 последних сообщений...")
-            async for msg in client.iter_messages(owner_id, limit=500):
-                if not msg or not msg.raw_text:
-                    continue
-                raw = msg.raw_text
-                if "FPROGRESS" in raw:
-                    found += 1
-                    log.info("📂 Fallback: найдено msg #%d с FPROGRESS: %s",
-                             msg.id, raw[:200])
-                    data = _parse_checkpoint_text(raw)
-                    if data:
-                        data['checkpoint_msg_id'] = msg.id
-                        return data
-            log.info("📂 Fallback: найдено FPROGRESS: %d", found)
-
+        if found_search > 0:
+            log.info("📂 Search: найдено %d сообщений, но ни одно не распарсилось", found_search)
+        else:
+            log.info("📂 Search: 0 результатов (возможно, API не доступен для бота)")
     except Exception as e:
-        log.warning("Не удалось найти чекпойнт в ЛС: %s", str(e)[:300])
+        log.warning("📂 Search API не сработал: %s", str(e)[:200])
+
+    # Шаг 2: Fallback — прямой перебор 500 последних сообщений
+    log.info("📂 Fallback: прямой перебор 500 последних сообщений...")
+    try:
+        found_fb = 0
+        async for msg in client.iter_messages(owner_id, limit=500):
+            if not msg or not msg.raw_text:
+                continue
+            raw = msg.raw_text
+            if "FPROGRESS" in raw:
+                found_fb += 1
+                log.info("📂 Fallback: msg #%d содержит FPROGRESS, raw_text[:200]=%s", msg.id, raw[:200])
+                data = _parse_checkpoint_text(raw)
+                if data:
+                    log.info("📂 Fallback: Чекпойнт найден! words_sent=%s", data.get('words_sent','?'))
+                    data['checkpoint_msg_id'] = msg.id
+                    return data
+        log.info("📂 Fallback: проверено 500 сообщений, найдено FPROGRESS: %d", found_fb)
+    except Exception as e:
+        log.warning("📂 Fallback тоже не сработал: %s", str(e)[:300])
+
     return None
 
 async def _delete_checkpoint(chat_id, msg_id):
