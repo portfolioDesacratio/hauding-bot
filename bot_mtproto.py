@@ -455,6 +455,14 @@ def _build_backup_text():
     if ch_rows:
         progress_parts = [f"{r[0]}:{r[1]}" for r in ch_rows[:50]]  # макс 50 каналов
         lines.append(f"channel_progress={','.join(progress_parts)}")
+    # Сохраняем прогресс активного файла (чтобы возобновить после редеплоя)
+    fp_row = conn.execute(
+        "SELECT chat_id, msg_id, filename, file_size, words_sent FROM file_progress WHERE active=1 ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    if fp_row:
+        fp_chat, fp_msg, fp_fn, fp_size, fp_words = fp_row
+        # | как разделитель между полями (не встречается в именах файлов из Telegram)
+        lines.append(f"file_progress={fp_chat}|{fp_msg}|{fp_fn}|{fp_size}|{fp_words}")
     return "\n".join(lines)
 
 def _parse_backup_lines(text):
@@ -507,6 +515,21 @@ def _parse_backup_lines(text):
                         )
                         restored_count += 1
                 log.info("📦 Восстановлен прогресс %d каналов", restored_count)
+        elif line.startswith("file_progress="):
+            val = line.split("=", 1)[1].strip()
+            if val:
+                parts = val.split("|")
+                if len(parts) == 5:
+                    fp_chat, fp_msg, fp_fn, fp_size, fp_words = parts
+                    # Валидация: chat_id может быть отрицательным, остальные — цифры
+                    if (fp_chat.lstrip("-").isdigit() and fp_msg.isdigit() 
+                            and fp_size.isdigit() and fp_words.isdigit()):
+                        _save_file_progress(
+                            int(fp_chat), int(fp_msg), fp_fn,
+                            0, int(fp_words), 0, 0, int(fp_size),
+                            checkpoint_msg_id=None
+                        )
+                        log.info("📦 Восстановлен прогресс файла: %s (слов: %s)", fp_fn, fp_words)
     conn.commit()
     return True
 
