@@ -788,13 +788,84 @@ async def on_msg(event):
                 if not (fn.endswith(".txt") or "text/plain" in (msg.file.mime_type or "")):
                     return
                 
-                # Пытаемся скачать файл. Если LOCATION_NOT_AVAILABLE — рефрешим сообщение и пробуем снова
+                file_size = msg.file.size if msg.file and msg.file.size else 0
+                is_owner_dm = event.is_private and is_owner(event)
+                
+                # ── Для больших файлов (>50MB) — стримим на диск, читаем частями ──
+                if file_size > 50 * 1024 * 1024:
+                    import tempfile, os
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt')
+                    tmp_path = tmp.name
+                    tmp.close()
+                    try:
+                        if is_owner_dm:
+                            await safe_send(event.chat_id, f"📥 Большой файл ({file_size//1024//1024}MB), обрабатываю построчно…")
+                        
+                        # Скачиваем на диск (не в RAM)
+                        try:
+                            await msg.download_media(file=tmp_path)
+                        except Exception as dl_err:
+                            log.warning("Файл %s (stream): download_media не сработал (%s), пробую рефреш", fn, str(dl_err)[:80])
+                            try:
+                                fresh = await client.get_messages(event.chat_id, ids=msg.id)
+                                if fresh and len(fresh) > 0:
+                                    await fresh[0].download_media(file=tmp_path)
+                            except Exception:
+                                pass
+                        
+                        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                            if is_owner_dm:
+                                await safe_send(event.chat_id, f"❌ Не удалось скачать файл {fn}")
+                            return
+                        
+                        # Читаем файл построчно, группируем абзацы (пустая строка = разделитель)
+                        para_lines = []
+                        total_sent = 0
+                        with open(tmp_path, 'r', encoding='utf-8', errors='replace') as f:
+                            for line in f:
+                                line = line.rstrip('\n\r')
+                                if line.strip() == '' and para_lines:
+                                    # Конец абзаца
+                                    para = '\n'.join(para_lines)
+                                    para = _clean_broadcast_text(para)
+                                    if wc(para) >= MIN_WORDS:
+                                        if is_owner_dm:
+                                            await send_to_output(para, fn, f"file:{fn}", force=True)
+                                        else:
+                                            if save_text(para.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
+                                                await send_to_output(para.strip(), title, f"file:{fn}", force=True)
+                                        total_sent += 1
+                                    para_lines = []
+                                elif line.strip() or para_lines:
+                                    para_lines.append(line)
+                        
+                        # Последний абзац (если нет завершающей пустой строки)
+                        if para_lines:
+                            para = '\n'.join(para_lines)
+                            para = _clean_broadcast_text(para)
+                            if wc(para) >= MIN_WORDS:
+                                if is_owner_dm:
+                                    await send_to_output(para, fn, f"file:{fn}", force=True)
+                                else:
+                                    if save_text(para.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
+                                        await send_to_output(para.strip(), title, f"file:{fn}", force=True)
+                                total_sent += 1
+                        
+                        if is_owner_dm:
+                            await safe_send(event.chat_id, f"✅ {fn}: {total_sent} абзацев отправлено")
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
+                    return
+                
+                # ── Для маленьких файлов (≤50MB) — скачиваем в память ──
                 fb = None
                 try:
                     fb = await msg.download_media(file=bytes)
                 except Exception as dl_err:
-                    dl_err_str = str(dl_err)
-                    log.warning("Файл %s: download_media не сработал (%s), пробую рефреш сообщения", fn, dl_err_str[:80])
+                    log.warning("Файл %s: download_media не сработал (%s), пробую рефреш", fn, str(dl_err)[:80])
                     try:
                         fresh = await client.get_messages(event.chat_id, ids=msg.id)
                         if fresh and len(fresh) > 0:
@@ -806,22 +877,19 @@ async def on_msg(event):
                     try:
                         fb = await client.download_file(msg.document, file=bytes)
                     except Exception as e2:
-                        log.error("Файл %s: download_file тоже не сработал: %s", fn, e2)
+                        log.error("Файл %s: download_file не сработал: %s", fn, e2)
                 
                 if not fb:
-                    log.error("Файл %s: не удалось скачать (все способы)", fn)
-                    if event.is_private and is_owner(event):
-                        await safe_send(event.chat_id, f"❌ Файл {fn} не удалось скачать. Возможно, он слишком старый или удалён.")
+                    if is_owner_dm:
+                        await safe_send(event.chat_id, f"❌ Файл {fn} не удалось скачать (возможно, удалён или слишком старый).")
                     return
                 
                 text_content = fb.decode("utf-8", errors="replace")
-                text_content = _clean_broadcast_text(text_content)  # удаляем плохие слова
+                text_content = _clean_broadcast_text(text_content)
                 
-                # Если файл прислал владелец в ЛС — broadcast частями
-                if event.is_private and is_owner(event):
+                if is_owner_dm:
                     await broadcast_file(text_content, fn, event)
                 else:
-                    # Старое поведение: абзацы в базу (force=True — файлы всегда)
                     for b in re.split(r'\n\s*\n', text_content):
                         if wc(b) >= MIN_WORDS:
                             if save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
