@@ -818,6 +818,85 @@ async def on_msg(event):
                             await safe_send(event.chat_id, "❌ Не удалось получить document для скачивания")
                         return
                     
+                    # Для файлов от владельца — шлём всё без фильтра 50 слов, чанками по 600 слов (как broadcast_file)
+                    # Для остальных — с фильтром, каждый абзац отдельно
+                    CHUNK_WORDS = 600
+                    word_buffer = []
+                    total_chunks = 0
+                    total_skipped = 0
+                    chunk_buf = b''
+                    report_time = time.time()
+                    bytes_downloaded = 0
+                    
+                    def _decode_chunk(buf):
+                        try:
+                            return buf.decode('utf-8'), b''
+                        except UnicodeDecodeError:
+                            for cut in range(len(buf), max(0, len(buf) - 8), -1):
+                                try:
+                                    return buf[:cut].decode('utf-8'), buf[cut:]
+                                except UnicodeDecodeError:
+                                    continue
+                            return buf.decode('utf-8', errors='replace'), b''
+                    
+                    async def _flush_chunk(force=False):
+                        nonlocal word_buffer, total_chunks
+                        text = ' '.join(word_buffer)
+                        text = _clean_broadcast_text(text)
+                        if not text.strip():
+                            word_buffer = []
+                            return
+                        if is_owner_dm:
+                            # Владельцу — без фильтра, сразу отправляем
+                            if force or len(word_buffer) >= CHUNK_WORDS:
+                                await send_to_output(text, fn, f"file:{fn}", force=True)
+                                total_chunks += 1
+                                word_buffer = []
+                        else:
+                            # Не владельцу — с фильтром 50 слов
+                            if wc(text) >= MIN_WORDS:
+                                if save_text(text.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
+                                    await send_to_output(text.strip(), title, f"file:{fn}", force=True)
+                                    total_chunks += 1
+                            word_buffer = []
+                    
+                    try:
+                        async for chunk in client.iter_download(doc, request_size=262144, file_size=file_size):
+                            chunk_buf += chunk
+                            bytes_downloaded += len(chunk)
+                            text, chunk_buf = _decode_chunk(chunk_buf)
+                            
+                            # Разбиваем на слова (по пробелам), накапливаем в буфер
+                            words = text.split()
+                            for w in words:
+                                word_buffer.append(w)
+                                if len(word_buffer) >= CHUNK_WORDS:
+                                    await _flush_chunk()
+                            
+                            if is_owner_dm and time.time() - report_time > 15:
+                                report_time = time.time()
+                                pct = min(100, bytes_downloaded * 100 // max(1, file_size))
+                                await safe_send(event.chat_id,
+                                    f"⏳ {fn}: {bytes_downloaded//1024//1024}MB / {file_size//1024//1024}MB ({pct}%), "
+                                    f"отправлено {total_chunks} чанков")
+                    
+                    except Exception as stream_err:
+                        log.exception("Файл %s: ошибка при стриминге: %s", fn, stream_err)
+                        if is_owner_dm:
+                            await safe_send(event.chat_id, f"❌ Ошибка при стриминге {fn}: {str(stream_err)[:200]}")
+                    
+                    # Остаток буфера
+                    if chunk_buf:
+                        text, _ = _decode_chunk(chunk_buf)
+                        for w in text.split():
+                            word_buffer.append(w)
+                    
+                    await _flush_chunk(force=True)
+                    
+                    if is_owner_dm:
+                        await safe_send(event.chat_id, f"✅ {fn}: {total_chunks} чанков отправлено (пропущено {total_skipped})")
+                    return
+                    
                     async def _send_para(para_text):
                         nonlocal total_sent
                         para_text = _clean_broadcast_text(para_text)
