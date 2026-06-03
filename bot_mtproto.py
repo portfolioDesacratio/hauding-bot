@@ -803,8 +803,33 @@ async def on_msg(event):
                 fn = msg.file.name or "unknown.txt"
                 if not (fn.endswith(".txt") or "text/plain" in (msg.file.mime_type or "")):
                     return
-                fb = await msg.download_media(file=bytes)
-                if not fb: fb = await client.download_file(msg.document, file=bytes)
+                
+                # Пытаемся скачать файл. Если LOCATION_NOT_AVAILABLE — рефрешим сообщение и пробуем снова
+                fb = None
+                try:
+                    fb = await msg.download_media(file=bytes)
+                except Exception as dl_err:
+                    dl_err_str = str(dl_err)
+                    log.warning("Файл %s: download_media не сработал (%s), пробую рефреш сообщения", fn, dl_err_str[:80])
+                    try:
+                        fresh = await client.get_messages(event.chat_id, ids=msg.id)
+                        if fresh and len(fresh) > 0:
+                            fb = await fresh[0].download_media(file=bytes)
+                    except Exception:
+                        pass
+                
+                if not fb:
+                    try:
+                        fb = await client.download_file(msg.document, file=bytes)
+                    except Exception as e2:
+                        log.error("Файл %s: download_file тоже не сработал: %s", fn, e2)
+                
+                if not fb:
+                    log.error("Файл %s: не удалось скачать (все способы)", fn)
+                    if event.is_private and is_owner(event):
+                        await safe_send(event.chat_id, f"❌ Файл {fn} не удалось скачать. Возможно, он слишком старый или удалён.")
+                    return
+                
                 text_content = fb.decode("utf-8", errors="replace")
                 text_content = _clean_broadcast_text(text_content)  # удаляем плохие слова
                 
@@ -818,9 +843,9 @@ async def on_msg(event):
                             if save_text(b.strip(), title, str(chat.id), msg.id, f"file:{fn}"):
                                 await send_to_output(b.strip(), title, f"file:{fn}", force=True)
             except Exception as e:
-                log.error("Файл: %s", e)
+                log.exception("Файл %s: необработанная ошибка", fn)
                 if event.is_private and is_owner(event):
-                    await safe_send(event.chat_id, f"❌ Ошибка при обработке файла: {str(e)[:200]}")
+                    await safe_send(event.chat_id, f"❌ Ошибка при обработке файла {fn}: {str(e)[:200]}")
     except Exception as e:
         log.exception("❌ on_msg: %s", e)
 
