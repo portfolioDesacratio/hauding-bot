@@ -359,14 +359,23 @@ async def _send_checkpoint(data):
 async def _find_latest_checkpoint(owner_id):
     """Сканирует ЛС владельца в поисках последнего чекпойнта __FPROGRESS__"""
     try:
-        async for msg in client.iter_messages(owner_id, limit=200):
-            if msg and msg.text and msg.text.startswith(_FP_PREFIX):
-                data = _parse_checkpoint_text(msg.text)
-                if data:
-                    data['checkpoint_msg_id'] = msg.id
-                    return data
+        found = 0
+        async for msg in client.iter_messages(owner_id, limit=500):
+            if msg and msg.text:
+                if msg.text.startswith(_FP_PREFIX):
+                    found += 1
+                    data = _parse_checkpoint_text(msg.text)
+                    if data:
+                        log.info("📂 Чекпойнт #%d: msg_id=%s words_sent=%s active=%s",
+                                 found, data.get('msg_id','?'), data.get('words_sent','?'), data.get('active','?'))
+                        data['checkpoint_msg_id'] = msg.id
+                        return data
+                    else:
+                        log.info("📂 Нашёл __FPROGRESS__ но _parse_checkpoint_text вернул None (active=0 или кривой формат)")
+                        log.info("   Текст: %s", msg.text[:300])
+        log.info("📂 _find_latest_checkpoint: проверено сообщений, найдено FPROGRESS: %d", found)
     except Exception as e:
-        log.warning("Не удалось найти чекпойнт в ЛС: %s", e)
+        log.warning("Не удалось найти чекпойнт в ЛС: %s", str(e)[:300])
     return None
 
 async def _delete_checkpoint(chat_id, msg_id):
@@ -938,13 +947,7 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
                     (cp_msg_id, chat_id, msg_id)
                 )
                 conn.commit()
-            cp_msg_id = await _send_checkpoint(cp_data)
-            if cp_msg_id:
-                conn.execute(
-                    "UPDATE file_progress SET checkpoint_msg_id=? WHERE chat_id=? AND msg_id=?",
-                    (cp_msg_id, chat_id, msg_id)
-                )
-                conn.commit()
+
 
     try:
         async for chunk in client.iter_download(doc, request_size=262144, file_size=file_size):
@@ -1017,6 +1020,13 @@ async def _resume_file_streaming():
        Сначала проверяет SQLite, потом Telegram чекпойнты.
        Отправляет диагностику владельцу в ЛС."""
     try:
+        # Принудительно резолвим владельца (кэшируем access_hash для нового сеанса после редеплоя)
+        try:
+            await client.get_entity(OWNER_ID)
+            log.info("📂 Владелец зарезолвлен: %d", OWNER_ID)
+        except Exception as e:
+            log.warning("📂 Не удалось зарезолвить владельца: %s", str(e)[:200])
+
         fp = _get_active_file_progress()
         source = "SQLite"
         if fp:

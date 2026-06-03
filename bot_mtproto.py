@@ -360,14 +360,23 @@ async def _send_checkpoint(data):
 async def _find_latest_checkpoint(owner_id):
     """Сканирует ЛС владельца в поисках последнего чекпойнта __FPROGRESS__"""
     try:
-        async for msg in client.iter_messages(owner_id, limit=200):
-            if msg and msg.text and msg.text.startswith(_FP_PREFIX):
-                data = _parse_checkpoint_text(msg.text)
-                if data:
-                    data['checkpoint_msg_id'] = msg.id
-                    return data
+        found = 0
+        async for msg in client.iter_messages(owner_id, limit=500):
+            if msg and msg.text:
+                if msg.text.startswith(_FP_PREFIX):
+                    found += 1
+                    data = _parse_checkpoint_text(msg.text)
+                    if data:
+                        log.info("📂 Чекпойнт #%d: msg_id=%s words_sent=%s active=%s",
+                                 found, data.get('msg_id','?'), data.get('words_sent','?'), data.get('active','?'))
+                        data['checkpoint_msg_id'] = msg.id
+                        return data
+                    else:
+                        log.info("📂 Нашёл __FPROGRESS__ но _parse_checkpoint_text вернул None (active=0 или кривой формат)")
+                        log.info("   Текст: %s", msg.text[:300])
+        log.info("📂 _find_latest_checkpoint: проверено сообщений, найдено FPROGRESS: %d", found)
     except Exception as e:
-        log.warning("Не удалось найти чекпойнт в ЛС: %s", e)
+        log.warning("Не удалось найти чекпойнт в ЛС: %s", str(e)[:300])
     return None
 
 async def _delete_checkpoint(chat_id, msg_id):
@@ -954,13 +963,6 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
                     (cp_msg_id, chat_id, msg_id)
                 )
                 conn.commit()
-            cp_msg_id = await _send_checkpoint(cp_data)
-            if cp_msg_id:
-                conn.execute(
-                    "UPDATE file_progress SET checkpoint_msg_id=? WHERE chat_id=? AND msg_id=?",
-                    (cp_msg_id, chat_id, msg_id)
-                )
-                conn.commit()
 
     try:
         async for chunk in client.iter_download(doc, request_size=262144, file_size=file_size):
@@ -1033,6 +1035,13 @@ async def _resume_file_streaming():
        Сначала проверяет SQLite, потом Telegram чекпойнты.
        Отправляет диагностику владельцу в ЛС."""
     try:
+        # Принудительно резолвим владельца (кэшируем access_hash для нового сеанса после редеплоя)
+        try:
+            await client.get_entity(OWNER_ID)
+            log.info("📂 Владелец зарезолвлен: %d", OWNER_ID)
+        except Exception as e:
+            log.warning("📂 Не удалось зарезолвить владельца: %s", str(e)[:200])
+
         fp = _get_active_file_progress()
         source = "SQLite"
         if fp:
@@ -1591,6 +1600,17 @@ async def cmd_resume(event):
     except Exception as e:
         log.exception("cmd_resume: %s", e)
 
+async def cmd_resume_file(event):
+    """Ручное возобновление отправки файла после рестарта"""
+    try:
+        if not is_owner(event): return
+        await safe_send(event.chat_id, "🔄 Проверяю возможность возобновления файла...")
+        asyncio.create_task(_resume_file_streaming())
+        await safe_send(event.chat_id, "✅ Задача запущена. Следи за логами.")
+    except Exception as e:
+        log.exception("cmd_resume_file: %s", e)
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+
 async def cmd_debug(event):
     try:
         if not is_owner(event): return
@@ -1685,6 +1705,7 @@ def register_handlers():
     client.add_event_handler(cmd_set_output, events.NewMessage(pattern=r"^/set_output(?:\s+(.+))?$"))
     client.add_event_handler(cmd_pause, events.NewMessage(pattern=r"^/pause$"))
     client.add_event_handler(cmd_resume, events.NewMessage(pattern=r"^/resume$"))
+    client.add_event_handler(cmd_resume_file, events.NewMessage(pattern=r"^/resume_file$"))
     client.add_event_handler(cmd_debug, events.NewMessage(pattern=r"^/debug$"))
     client.add_event_handler(cmd_data_dir, events.NewMessage(pattern=r"^/data_dir$"))
     client.add_event_handler(cmd_reseed, events.NewMessage(pattern=r"^/reseed$"))
