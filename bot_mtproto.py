@@ -1601,15 +1601,46 @@ async def cmd_resume(event):
         log.exception("cmd_resume: %s", e)
 
 async def cmd_resume_file(event):
-    """Ручное возобновление отправки файла после рестарта"""
+    """Ручное возобновление отправки файла после рестарта (с диагностикой)"""
     try:
         if not is_owner(event): return
-        await safe_send(event.chat_id, "🔄 Проверяю возможность возобновления файла...")
-        asyncio.create_task(_resume_file_streaming())
-        await safe_send(event.chat_id, "✅ Задача запущена. Следи за логами.")
+        await safe_send(event.chat_id, "🔍 Диагностика возобновления файла...")
+        
+        # Шаг 1: пытаемся зарезолвить владельца
+        try:
+            me = await client.get_entity(OWNER_ID)
+            await safe_send(event.chat_id, f"✅ Владелец зарезолвлен: {me.id} ({getattr(me, 'username', '?')})")
+        except Exception as e:
+            await safe_send(event.chat_id, f"❌ Не удалось зарезолвить владельца: {str(e)[:200]}")
+            return
+        
+        # Шаг 2: проверяем SQLite
+        fp = _get_active_file_progress()
+        if fp:
+            await safe_send(event.chat_id,
+                f"📂 SQLite: {fp['filename']}, words_sent={fp['words_sent']}")
+        else:
+            await safe_send(event.chat_id, "📂 SQLite: пусто")
+        
+        # Шаг 3: ищем чекпойнт в Telegram
+        await safe_send(event.chat_id, "🔍 Сканирую последние 500 сообщений в ЛС...")
+        cp = await _find_latest_checkpoint(OWNER_ID)
+        if cp:
+            await safe_send(event.chat_id,
+                f"✅ Чекпойнт найден: {cp.get('filename','?')}, "
+                f"words_sent={cp.get('words_sent','?')}, "
+                f"active={cp.get('active','?')}")
+            # Запускаем стриминг в фоне (чтобы не блокировать хендлер часами)
+            await safe_send(event.chat_id, "🔄 Запускаю возобновление отправки в фоне...")
+            asyncio.create_task(_resume_file_streaming())
+        else:
+            await safe_send(event.chat_id, "❌ Чекпойнт НЕ НАЙДЕН в последних 500 сообщениях")
+            # Если нет чекпойнта — нечего возобновлять
+            return
+        
     except Exception as e:
         log.exception("cmd_resume_file: %s", e)
-        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:300]}")
 
 async def cmd_debug(event):
     try:
