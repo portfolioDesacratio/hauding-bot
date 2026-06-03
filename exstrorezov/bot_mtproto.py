@@ -1057,13 +1057,12 @@ async def _resume_file_streaming():
         # Получаем сообщение с файлом
         file_msg = None
         try:
-            file_msgs = await client.get_messages(fp['chat_id'], ids=fp['msg_id'])
-            if not file_msgs or len(file_msgs) == 0:
+            file_msg = await client.get_messages(fp['chat_id'], ids=fp['msg_id'])
+            if file_msg is None:
                 log.warning("📂 Сообщение с файлом #%d удалено или недоступно", fp['msg_id'])
                 await safe_send(OWNER_ID, f"❌ Сообщение с файлом #{fp['msg_id']} удалено или недоступно")
                 _mark_file_progress_done(fp['chat_id'], fp['msg_id'])
                 return
-            file_msg = file_msgs[0]
         except Exception as e:
             log.warning("📂 Не удалось получить сообщение с файлом: %s", e)
             await safe_send(OWNER_ID, f"❌ Ошибка получения файла: {str(e)[:200]}")
