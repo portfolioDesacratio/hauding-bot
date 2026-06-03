@@ -926,11 +926,18 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
     # Создаём/обновляем запись прогресса в SQLite (сохраняем words_to_skip на случай ошибки до первого флаша)
     _save_file_progress(chat_id, msg_id, fn, 0, words_to_skip, 0, 0, file_size)
 
-    # Если есть words_to_skip — отправляем чекпойнт с самого начала
-    if is_owner_dm and words_to_skip > 0:
+    # Отправляем чекпойнт в Telegram сразу же — чтобы при редеплое был fallback
+    if is_owner_dm:
         cp_data = _get_active_file_progress()
         if cp_data:
             cp_data['words_sent'] = words_to_skip
+            cp_msg_id = await _send_checkpoint(cp_data)
+            if cp_msg_id:
+                conn.execute(
+                    "UPDATE file_progress SET checkpoint_msg_id=? WHERE chat_id=? AND msg_id=?",
+                    (cp_msg_id, chat_id, msg_id)
+                )
+                conn.commit()
             cp_msg_id = await _send_checkpoint(cp_data)
             if cp_msg_id:
                 conn.execute(
@@ -1000,65 +1007,88 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
 
 async def _resume_file_streaming():
     """Проверяет, есть ли незавершённая отправка файла, и возобновляет её.
-       Сначала проверяет SQLite, потом Telegram чекпойнты."""
-    fp = _get_active_file_progress()
-    if fp:
-        log.info("📂 Найден активный прогресс файла в SQLite: %s (слов: %d/%d)",
-                 fp['filename'], fp['words_sent'], fp['total_words'])
-    else:
-        # Если SQLite пуст (редеплой) — ищем чекпойнт в ЛС владельца
-        log.info("📂 SQLite пуст, ищу чекпойнт в ЛС владельца...")
-        fp = await _find_latest_checkpoint(OWNER_ID)
+       Сначала проверяет SQLite, потом Telegram чекпойнты.
+       Отправляет диагностику владельцу в ЛС."""
+    try:
+        fp = _get_active_file_progress()
+        source = "SQLite"
         if fp:
-            log.info("📂 Найден чекпойнт в Telegram: %s (слов: %d/%d)",
-                     fp.get('filename', '?'), fp.get('words_sent', 0), fp.get('total_words', 0))
-            # Восстанавливаем в SQLite
-            _save_file_progress(
-                fp['chat_id'], fp['msg_id'],
-                fp.get('filename', 'unknown.txt'),
-                fp.get('total_words', 0), fp.get('words_sent', 0),
-                0, 0, fp.get('file_size', 0),
-                fp.get('checkpoint_msg_id')
-            )
+            log.info("📂 Найден активный прогресс файла в SQLite: %s (слов: %d/%d)",
+                     fp['filename'], fp['words_sent'], fp['total_words'])
         else:
-            log.info("📂 Нет незавершённых файлов")
+            # Если SQLite пуст (редеплой) — ищем чекпойнт в ЛС владельца
+            log.info("📂 SQLite пуст, ищу чекпойнт в ЛС владельца...")
+            fp = await _find_latest_checkpoint(OWNER_ID)
+            if fp:
+                source = "Telegram"
+                log.info("📂 Найден чекпойнт в Telegram: %s (слов: %d/%d)",
+                         fp.get('filename', '?'), fp.get('words_sent', 0), fp.get('total_words', 0))
+                # Восстанавливаем в SQLite
+                _save_file_progress(
+                    fp['chat_id'], fp['msg_id'],
+                    fp.get('filename', 'unknown.txt'),
+                    fp.get('total_words', 0), fp.get('words_sent', 0),
+                    0, 0, fp.get('file_size', 0),
+                    fp.get('checkpoint_msg_id')
+                )
+            else:
+                # Нет прогресса — это нормально (первый запуск, файлов не было)
+                log.info("📂 Нет незавершённых файлов (SQLite пуст, чекпойнт не найден)")
+                return
+
+        if not fp:
             return
 
-    if not fp:
-        return
+        # Сообщаем владельцу что нашли
+        try:
+            await safe_send(OWNER_ID,
+                f"📂 Найден прогресс файла ({source}): {fp.get('filename','?')}, "
+                f"отправлено {fp['words_sent']} слов")
+        except:
+            pass
 
-    # Получаем сообщение с файлом
-    try:
-        file_msgs = await client.get_messages(fp['chat_id'], ids=fp['msg_id'])
-        if not file_msgs or len(file_msgs) == 0:
-            log.warning("📂 Сообщение с файлом #%d удалено или недоступно", fp['msg_id'])
+        # Получаем сообщение с файлом
+        file_msg = None
+        try:
+            file_msgs = await client.get_messages(fp['chat_id'], ids=fp['msg_id'])
+            if not file_msgs or len(file_msgs) == 0:
+                log.warning("📂 Сообщение с файлом #%d удалено или недоступно", fp['msg_id'])
+                await safe_send(OWNER_ID, f"❌ Сообщение с файлом #{fp['msg_id']} удалено или недоступно")
+                _mark_file_progress_done(fp['chat_id'], fp['msg_id'])
+                return
+            file_msg = file_msgs[0]
+        except Exception as e:
+            log.warning("📂 Не удалось получить сообщение с файлом: %s", e)
+            await safe_send(OWNER_ID, f"❌ Ошибка получения файла: {str(e)[:200]}")
+            return
+
+        if not file_msg.document:
+            log.warning("📂 Сообщение #%d больше не содержит файла", fp['msg_id'])
+            await safe_send(OWNER_ID, f"❌ Сообщение #{fp['msg_id']} больше не содержит файла")
             _mark_file_progress_done(fp['chat_id'], fp['msg_id'])
             return
-        file_msg = file_msgs[0]
+
+        fn = file_msg.file.name or "unknown.txt"
+        file_size = file_msg.file.size or 0
+        is_owner_dm = fp['chat_id'] in OWNER_IDS
+
+        log.info("📂 Возобновляю отправку файла %s с позиции %d слов...",
+                 fn, fp['words_sent'])
+
+        await safe_send(fp['chat_id'],
+            f"🔄 Возобновляю отправку файла {fn} ({file_size//1024//1024}MB) с {fp['words_sent']} слов...")
+
+        await _stream_file_from_msg(
+            file_msg, fp['chat_id'], fp['msg_id'], file_size,
+            fn, fn, fn, is_owner_dm,
+            words_to_skip=fp['words_sent']
+        )
     except Exception as e:
-        log.warning("📂 Не удалось получить сообщение с файлом: %s", e)
-        return
-
-    if not file_msg.document:
-        log.warning("📂 Сообщение #%d больше не содержит файла", fp['msg_id'])
-        _mark_file_progress_done(fp['chat_id'], fp['msg_id'])
-        return
-
-    fn = file_msg.file.name or "unknown.txt"
-    file_size = file_msg.file.size or 0
-    is_owner_dm = fp['chat_id'] in OWNER_IDS
-
-    log.info("📂 Возобновляю отправку файла %s с позиции %d слов...",
-             fn, fp['words_sent'])
-
-    await safe_send(fp['chat_id'],
-        f"🔄 Возобновляю отправку файла {fn} ({file_size//1024//1024}MB) с {fp['words_sent']} слов...")
-
-    await _stream_file_from_msg(
-        file_msg, fp['chat_id'], fp['msg_id'], file_size,
-        fn, fn, fn, is_owner_dm,
-        words_to_skip=fp['words_sent']
-    )
+        log.exception("📂 _resume_file_streaming: необработанная ошибка: %s", e)
+        try:
+            await safe_send(OWNER_ID, f"❌ Ошибка при возобновлении файла: {str(e)[:200]}")
+        except:
+            pass
 
 # ─── Обработчик всех сообщений ─────────────────────────────────────
 # ─── Обработчик всех сообщений ─────────────────────────────────────
