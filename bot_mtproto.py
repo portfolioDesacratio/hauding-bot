@@ -1006,15 +1006,16 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
             word_buffer = []
 
         # Сохраняем прогресс в SQLite (каждые 1 чанк — чтобы при любом рестарте минимум потерь)
+        cumulative_words = words_to_skip + total_words
         if total_chunks > 0 and total_chunks % 1 == 0:
-            _save_file_progress(chat_id, msg_id, fn, 0, total_words, 0, total_chunks, file_size)
+            _save_file_progress(chat_id, msg_id, fn, 0, cumulative_words, 0, total_chunks, file_size)
 
         # Чекпойнт в Telegram каждые checkpoint_interval чанков
         if is_owner_dm and total_chunks > 0 and (total_chunks - last_checkpoint_chunks) >= checkpoint_interval:
             last_checkpoint_chunks = total_chunks
             cp_data = _get_active_file_progress()
             if cp_data:
-                cp_data['words_sent'] = total_words
+                cp_data['words_sent'] = cumulative_words
                 cp_msg_id = await _send_checkpoint(cp_data)
                 if cp_msg_id:
                     conn.execute(
@@ -1066,8 +1067,8 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
         log.exception("Файл %s: ошибка при стриминге: %s", fn, stream_err)
         if is_owner_dm:
             await safe_send(chat_id, f"❌ Ошибка при стриминге {fn}: {str(stream_err)[:200]}")
-        # Сохраняем прогресс на случай ошибки
-        _save_file_progress(chat_id, msg_id, fn, 0, total_words, 0, total_chunks, file_size)
+        # Сохраняем прогресс на случай ошибки (кумулятивный words_sent = words_to_skip + total_words)
+        _save_file_progress(chat_id, msg_id, fn, 0, words_to_skip + total_words, 0, total_chunks, file_size)
         return total_chunks, total_words
 
     # Остаток буфера
