@@ -882,7 +882,7 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
     chunk_buf = b''
     report_time = time.time()
     bytes_downloaded = 0
-    checkpoint_interval = 50  # обновлять чекпойнт в Telegram каждые N чанков
+    checkpoint_interval = 20  # обновлять чекпойнт в Telegram каждые N чанков
     last_checkpoint_chunks = 0
 
     def _decode_chunk(buf):
@@ -919,8 +919,8 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
                     total_words += len(word_buffer)
             word_buffer = []
 
-        # Сохраняем прогресс в SQLite (каждые 5 чанков)
-        if total_chunks > 0 and total_chunks % 5 == 0:
+        # Сохраняем прогресс в SQLite (каждые 1 чанк — чтобы при любом рестарте минимум потерь)
+        if total_chunks > 0 and total_chunks % 1 == 0:
             _save_file_progress(chat_id, msg_id, fn, 0, total_words, 0, total_chunks, file_size)
 
         # Чекпойнт в Telegram каждые checkpoint_interval чанков
@@ -937,8 +937,8 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
                     )
                     conn.commit()
 
-    # Создаём/обновляем запись прогресса в SQLite
-    _save_file_progress(chat_id, msg_id, fn, 0, 0, 0, 0, file_size)
+    # Создаём/обновляем запись прогресса в SQLite (сохраняем words_to_skip на случай ошибки до первого флаша)
+    _save_file_progress(chat_id, msg_id, fn, 0, words_to_skip, 0, 0, file_size)
 
     # Если есть words_to_skip — отправляем чекпойнт с самого начала
     if is_owner_dm and words_to_skip > 0:
@@ -2717,16 +2717,18 @@ async def main():
         except Exception as e:
             log.warning("⚠️ run_until_disconnected завершился: %s", str(e)[:100])
 
+        # Даём время фоновым задачам (стриминг файла) сохранить прогресс
+        await asyncio.sleep(3)
+
         # ── Очистка перед следующим циклом ─────────────────────────
         log.info("🔄 Завершаю задачи цикла...")
         qw_task.cancel()
         for t in bg_tasks:
             t.cancel()
         # Сбрасываем сессионные кеши (они будут перестроены при реконнекте)
+        # НЕ трогаем file_progress — активный прогресс файла должен выжить между циклами!
         _SENT_HASHES.clear()
         _sess_dup.clear()
-        conn.execute("DELETE FROM file_progress WHERE active=1 AND words_sent > 0")
-        conn.commit()
 
         log.info("🔄 Ожидание 5с перед переподключением...")
         await asyncio.sleep(5)
