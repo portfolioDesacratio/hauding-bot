@@ -370,12 +370,17 @@ async def _send_checkpoint(data):
 
 async def _find_latest_checkpoint(owner_id):
     """Сканирует ЛС владельца в поисках последнего чекпойнта FPROGRESS.
-       Сначала пробует search API. Если API не дал — fallback на перебор 500 сообщений.
-       search API может не работать для ботов — fallback обязателен."""
-    # Шаг 1: пробуем search API (может не работать для ботов)
+       Использует user-клиент (uc.iter_messages), потому что bot-клиент
+       может не видеть историю сообщений в ЛС (особенно свои собственные)."""
+    uc = get_user_client()
+    if not uc or not uc.is_connected():
+        log.warning("📂 User-клиент недоступен — не могу сканировать ЛС")
+        return None
+
+    # Шаг 1: пробуем search API (может не работать даже для user-клиента)
     try:
         found_search = 0
-        async for msg in client.iter_messages(owner_id, search="FPROGRESS", limit=20):
+        async for msg in uc.iter_messages(owner_id, search="FPROGRESS", limit=20):
             if not msg or not msg.raw_text:
                 continue
             found_search += 1
@@ -389,15 +394,15 @@ async def _find_latest_checkpoint(owner_id):
         if found_search > 0:
             log.info("📂 Search: найдено %d сообщений, но ни одно не распарсилось", found_search)
         else:
-            log.info("📂 Search: 0 результатов (возможно, API не доступен для бота)")
+            log.info("📂 Search: 0 результатов")
     except Exception as e:
         log.warning("📂 Search API не сработал: %s", str(e)[:200])
 
-    # Шаг 2: Fallback — прямой перебор 500 последних сообщений
-    log.info("📂 Fallback: прямой перебор 500 последних сообщений...")
+    # Шаг 2: Fallback — прямой перебор 500 последних сообщений (ЧЕРЕЗ user-клиент)
+    log.info("📂 Fallback: перебор 500 сообщений через user-клиент...")
     try:
         found_fb = 0
-        async for msg in client.iter_messages(owner_id, limit=500):
+        async for msg in uc.iter_messages(owner_id, limit=500):
             if not msg or not msg.raw_text:
                 continue
             raw = msg.raw_text
@@ -1684,6 +1689,34 @@ async def cmd_resume_file(event):
         log.exception("cmd_resume_file: %s", e)
         await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:300]}")
 
+async def cmd_setfp(event):
+    """Ручное восстановление прогресса файла: /setfp chat_id msg_id filename file_size words_sent"""
+    try:
+        if not is_owner(event): return
+        parts = event.message.raw_text.strip().split(maxsplit=5)
+        if len(parts) < 6:
+            await safe_send(event.chat_id,
+                "❌ Формат: /setfp chat_id msg_id filename file_size words_sent\n"
+                "Пример: /setfp 8587090554 3387 channels_dump.txt 595323474 36000")
+            return
+        _, fp_chat, fp_msg, fp_fn, fp_size, fp_words = parts
+        if not (fp_chat.lstrip("-").isdigit() and fp_msg.isdigit()
+                and fp_size.isdigit() and fp_words.isdigit()):
+            await safe_send(event.chat_id, "❌ chat_id, msg_id, file_size, words_sent должны быть числами")
+            return
+        _save_file_progress(
+            int(fp_chat), int(fp_msg), fp_fn,
+            0, int(fp_words), 0, 0, int(fp_size),
+            checkpoint_msg_id=None
+        )
+        await safe_send(event.chat_id,
+            f"✅ Прогресс сохранён: {fp_fn}, words_sent={fp_words}\n"
+            f"Запускаю возобновление...")
+        asyncio.create_task(_resume_file_streaming())
+    except Exception as e:
+        log.exception("cmd_setfp: %s", e)
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+
 async def cmd_debug(event):
     try:
         if not is_owner(event): return
@@ -1779,6 +1812,7 @@ def register_handlers():
     client.add_event_handler(cmd_pause, events.NewMessage(pattern=r"^/pause$"))
     client.add_event_handler(cmd_resume, events.NewMessage(pattern=r"^/resume$"))
     client.add_event_handler(cmd_resume_file, events.NewMessage(pattern=r"^/resume_file$"))
+    client.add_event_handler(cmd_setfp, events.NewMessage(pattern=r"^/setfp\s+(.+)"))
     client.add_event_handler(cmd_debug, events.NewMessage(pattern=r"^/debug$"))
     client.add_event_handler(cmd_data_dir, events.NewMessage(pattern=r"^/data_dir$"))
     client.add_event_handler(cmd_reseed, events.NewMessage(pattern=r"^/reseed$"))
