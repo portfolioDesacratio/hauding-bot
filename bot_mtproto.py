@@ -298,7 +298,8 @@ def _mark_file_progress_done(chat_id, msg_id):
     conn.commit()
 
 # ─── Telegram checkpoint для файлового прогресса (переживает редеплой) ──
-_FP_PREFIX = "__FPROGRESS__\n"
+# ВНИМАНИЕ: без __префикса — Telegram/markdown интерпретирует __как__ italic!
+_FP_PREFIX = "FPROGRESS\n"
 
 def _build_checkpoint_text(chat_id, msg_id, filename, file_size, total_words, words_sent, active=True):
     return (
@@ -314,7 +315,15 @@ def _build_checkpoint_text(chat_id, msg_id, filename, file_size, total_words, wo
 
 def _parse_checkpoint_text(text):
     """Парсит чекпойнт из Telegram сообщения, возвращает dict или None"""
-    if not text or not text.startswith(_FP_PREFIX):
+    # Принимаем как с __FPROGRESS__ (старый формат, сломанный markdown'ом)
+    # так и с FPROGRESS (новый формат, без подчёркиваний)
+    if not text:
+        return None
+    if text.startswith("__FPROGRESS__\n"):
+        text = text[len("__FPROGRESS__\n"):]
+    elif text.startswith(_FP_PREFIX):
+        text = text[len(_FP_PREFIX):]
+    else:
         return None
     data = {}
     for line in text.split("\n"):
@@ -337,7 +346,10 @@ def _parse_checkpoint_text(text):
     return None
 
 async def _send_checkpoint(data):
-    """Отправляет или обновляет чекпойнт в ЛС владельцу"""
+    """Отправляет или обновляет чекпойнт в ЛС владельцу.
+       Отправляем с кастомным parse_mode (без markdown/html), чтобы FPROGRESS не сломался."""
+    def _no_parse(text):
+        return text, []
     try:
         text = _build_checkpoint_text(
             data['chat_id'], data['msg_id'], data['filename'],
@@ -347,33 +359,36 @@ async def _send_checkpoint(data):
         old_id = data.get('checkpoint_msg_id')
         if old_id:
             try:
-                await client.edit_message(data['chat_id'], old_id, text)
+                await client.edit_message(data['chat_id'], old_id, text, parse_mode=_no_parse)
                 return old_id
             except Exception:
                 pass  # не смогли отредактировать — шлём новое
-        msg = await client.send_message(data['chat_id'], text)
+        msg = await client.send_message(data['chat_id'], text, parse_mode=_no_parse)
         return msg.id
     except Exception as e:
         log.warning("Не удалось отправить чекпойнт: %s", e)
         return None
 
 async def _find_latest_checkpoint(owner_id):
-    """Сканирует ЛС владельца в поисках последнего чекпойнта __FPROGRESS__"""
+    """Сканирует ЛС владельца в поисках последнего чекпойнта FPROGRESS"""
     try:
         found = 0
         async for msg in client.iter_messages(owner_id, limit=500):
-            if msg and msg.text:
-                if msg.text.startswith(_FP_PREFIX):
-                    found += 1
-                    data = _parse_checkpoint_text(msg.text)
-                    if data:
-                        log.info("📂 Чекпойнт #%d: msg_id=%s words_sent=%s active=%s",
-                                 found, data.get('msg_id','?'), data.get('words_sent','?'), data.get('active','?'))
-                        data['checkpoint_msg_id'] = msg.id
-                        return data
-                    else:
-                        log.info("📂 Нашёл __FPROGRESS__ но _parse_checkpoint_text вернул None (active=0 или кривой формат)")
-                        log.info("   Текст: %s", msg.text[:300])
+            # Используем raw_text — он не зависит от markdown-реконструкции
+            raw = msg.raw_text if msg else ""
+            if not raw:
+                continue
+            if raw.startswith("FPROGRESS\n") or raw.startswith("__FPROGRESS__\n"):
+                found += 1
+                data = _parse_checkpoint_text(raw)
+                if data:
+                    log.info("📂 Чекпойнт #%d: msg_id=%s words_sent=%s active=%s",
+                             found, data.get('msg_id','?'), data.get('words_sent','?'), data.get('active','?'))
+                    data['checkpoint_msg_id'] = msg.id
+                    return data
+                else:
+                    log.info("📂 Нашёл FPROGRESS но _parse_checkpoint_text вернул None (active=0 или кривой формат)")
+                    log.info("   raw_text: %s", raw[:300])
         log.info("📂 _find_latest_checkpoint: проверено сообщений, найдено FPROGRESS: %d", found)
     except Exception as e:
         log.warning("Не удалось найти чекпойнт в ЛС: %s", str(e)[:300])
