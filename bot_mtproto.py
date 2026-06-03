@@ -248,12 +248,14 @@ def save_text(content, chat_title="?", chat_id="?", msg_id=None, link=None):
 
 # ─── Persistent pause state (переживает рестарты и редеплои через SQLite) ──
 def _load_pause_state():
-    """Читает состояние паузы из БД (информационно). Стартуем всегда с паузой - _scanning = False."""
+    """Читает состояние паузы из БД. Возвращает True если было сохранено, False если нет."""
     global _scanning
     row = conn.execute("SELECT value FROM config WHERE key='paused'").fetchone()
     if row:
         _scanning = row[0] != '1'
-        log.info("⏸ Загружено состояние паузы из БД: scanning=%s", _scanning)
+        log.info("⏸ Восстановлено состояние паузы из БД: scanning=%s", _scanning)
+        return True
+    return False
 
 def _save_pause_state(paused):
     """Сохраняет состояние паузы в БД"""
@@ -2671,9 +2673,10 @@ async def main():
             log.info("🔄 Сброшено %d error-каналов в pending", reset)
         await add_persistent_to_queue()
 
-        # 5. После рестарта — всегда пауза. Возобновляем отправку файла, если прервана.
-        _scanning = False
-        log.info("📌 Состояние: ⏸ пауза (после рестарта)")
+        # 5. Загружаем состояние паузы из БД. Если не было сохранено — пауза (default).
+        if not _load_pause_state():
+            _scanning = False  # fresh deploy — пауза по умолчанию
+        log.info("📌 Состояние: %s", "⏸ пауза" if not _scanning else "▶️ активен")
         asyncio.create_task(_resume_file_streaming())
 
         # 6. Queue worker
