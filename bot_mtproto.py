@@ -985,6 +985,9 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
     report_time = time.time()
     bytes_downloaded = 0
     checkpoint_interval = 20  # обновлять чекпойнт в Telegram каждые N чанков
+    # Когда bytes_to_skip > 0 — байтовый прыжок уже учёл пропущенные слова.
+    # Слово-скип нужен только как страховка от смещения на границе байт/слово (0 слов)
+    _skip_target = 0 if bytes_to_skip > 0 else words_to_skip
     last_checkpoint_chunks = 0
 
     def _decode_chunk(buf):
@@ -1071,8 +1074,9 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
 
             words = text.split()
             for w in words:
-                # Скипаем слова, если мы в режиме докачки
-                if skipped < words_to_skip:
+                # Скипаем слова, если мы в режиме докачки (по умолчанию _skip_target=words_to_skip,
+                # но если bytes_to_skip>0 — скип не нужен, _skip_target=0)
+                if skipped < _skip_target:
                     skipped += 1
                     continue
                 word_buffer.append(w)
@@ -1106,7 +1110,7 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
     if chunk_buf:
         text, _ = _decode_chunk(chunk_buf)
         for w in text.split():
-            if skipped < words_to_skip:
+            if skipped < _skip_target:
                 skipped += 1
                 continue
             word_buffer.append(w)
