@@ -1467,6 +1467,9 @@ async def cmd_start(event):
             "/set_output [@канал] — назначить канал вывода\n"
             "/pause — пауза\n"
             "/resume — продолжить\n"
+            "/resume_file — возобновить отправку файла после рестарта\n"
+            "/setfp chat_id msg_id filename file_size words_sent — ручной прогресс файла\n"
+            "/resetfp — сбросить ВЕСЬ прогресс файлов (забыть все файлы)\n"
             "/debug — диагностика\n"
             "/data_dir — путь к данным\n"
             "/reseed — сбросить очередь (только троллинг)\n\n"
@@ -1863,6 +1866,62 @@ async def cmd_setfp(event):
         log.exception("cmd_setfp: %s", e)
         await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
 
+async def cmd_resetfp(event):
+    """Сбрасывает ВЕСЬ прогресс файлов: чистит SQLite + удаляет FPROGRESS чекпойнты из Telegram.
+       После этой команды бот забывает все файлы навсегда (до следующей загрузки)."""
+    try:
+        if not is_owner(event): return
+        await safe_send(event.chat_id, "🔄 Сброс всего прогресса файлов...")
+
+        # 1. Помечаем ВСЕ file_progress как неактивные
+        conn.execute("UPDATE file_progress SET active=0")
+        conn.commit()
+        deleted_sqlite = conn.total_changes  # не точный счётчик, просто для лога
+        log.info("🧹 Сброшен прогресс файлов в SQLite")
+
+        # 2. Удаляем все FPROGRESS сообщения из ЛС владельца (через user клиент)
+        removed = 0
+        try:
+            uc = get_user_client()
+            if uc and uc.is_connected():
+                me_bot = await client.get_me()
+                bot_username = me_bot.username or me_bot.id
+                del_ids = []
+                async for msg in uc.iter_messages(bot_username, limit=500):
+                    if msg and msg.raw_text and "FPROGRESS" in msg.raw_text:
+                        del_ids.append(msg.id)
+                if del_ids:
+                    await uc.delete_messages(bot_username, del_ids)
+                    removed = len(del_ids)
+                    log.info("🧹 Удалено %d FPROGRESS чекпойнтов через user client", removed)
+            else:
+                log.warning("🧹 User client недоступен, Telegram чекпойнты не удалены")
+        except Exception as e:
+            log.warning("🧹 Ошибка при удалении FPROGRESS: %s", str(e)[:200])
+
+        # 3. Пробуем также удалить через bot client
+        try:
+            me_bot = await client.get_me()
+            bot_username = me_bot.username or me_bot.id
+            del_ids = []
+            async for msg in client.iter_messages(OWNER_ID, limit=500):
+                if msg and msg.raw_text and "FPROGRESS" in msg.raw_text:
+                    del_ids.append(msg.id)
+            if del_ids:
+                await client.delete_messages(OWNER_ID, del_ids)
+                log.info("🧹 Удалено %d FPROGRESS чекпойнтов через bot client", len(del_ids))
+        except Exception as e:
+            log.warning("🧹 bot client не смог удалить FPROGRESS: %s", str(e)[:200])
+
+        await safe_send(event.chat_id,
+            f"✅ Прогресс всех файлов сброшен.\n"
+            f"• SQLite: помечены неактивными\n"
+            f"• Telegram: удалено {removed} FPROGRESS сообщений\n"
+            f"Теперь можно кидать файл заново — начнёт с нуля.")
+    except Exception as e:
+        log.exception("cmd_resetfp: %s", e)
+        await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
+
 async def cmd_debug(event):
     try:
         if not is_owner(event): return
@@ -1959,6 +2018,7 @@ def register_handlers():
     client.add_event_handler(cmd_resume, events.NewMessage(pattern=r"^/resume$"))
     client.add_event_handler(cmd_resume_file, events.NewMessage(pattern=r"^/resume_file$"))
     client.add_event_handler(cmd_setfp, events.NewMessage(pattern=r"^/setfp\s+(.+)"))
+    client.add_event_handler(cmd_resetfp, events.NewMessage(pattern=r"^/resetfp$"))
     client.add_event_handler(cmd_debug, events.NewMessage(pattern=r"^/debug$"))
     client.add_event_handler(cmd_data_dir, events.NewMessage(pattern=r"^/data_dir$"))
     client.add_event_handler(cmd_reseed, events.NewMessage(pattern=r"^/reseed$"))
