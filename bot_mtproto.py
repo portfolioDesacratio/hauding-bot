@@ -469,6 +469,7 @@ session_path = str(DATA_DIR / "mt_session")
 client = TelegramClient(session_path, API_ID, API_HASH)
 RE_LINK = re.compile(r'(?:https?://)?(?:t\.me|telegram\.me)/([a-zA-Z0-9_+\-]{3,})')
 _scanning = False  # после любого рестарта/редеплоя — пауза (force=True для файлов владельца)
+_active_file_streaming_task = None  # текущая asyncio.Task стриминга файла (для /pause /resetfp)
 
 # ─── Бэкап настроек в Telegram (чтобы не слетало после редеплоя) ──
 BACKUP_MSG_ID_KEY = "backup_msg_id"
@@ -989,8 +990,12 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
        words_to_skip — сколько слов пропустить (для возобновления после рестарта).
        bytes_to_skip — сколько байт ПРОПУСТИТЬ с начала файла (начинаем скачку не с 0, а с этой позиции).
        Возвращает (total_chunks_sent, total_words_sent)."""
+    global _active_file_streaming_task
+    _active_file_streaming_task = asyncio.current_task()
+    log.info("📂 Стриминг файла начат, task=%s", _active_file_streaming_task)
     doc = msg.document if msg.document else (msg.media.document if msg.media and hasattr(msg.media, 'document') else None)
     if not doc:
+        _active_file_streaming_task = None
         return 0, 0
 
     CHUNK_WORDS = 600
@@ -1114,6 +1119,15 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
                         f"⏳ {fn}: {cumulative_bytes//1024//1024}MB / {file_size//1024//1024}MB ({pct}%), "
                         f"отправлено {total_chunks} чанков ({total_words} слов)")
 
+    except asyncio.CancelledError:
+        log.warning("⛔ Стриминг файла %s отменён (cancelled)", fn)
+        if is_owner_dm:
+            await safe_send(chat_id, f"⛔ Стриминг {fn} отменён")
+        # Сохраняем прогресс (не помечаем done — можно будет возобновить позже)
+        _save_file_progress(chat_id, msg_id, fn, 0, words_to_skip + total_words, 0, total_chunks, file_size,
+                           bytes_offset=bytes_to_skip + bytes_downloaded)
+        _active_file_streaming_task = None
+        return total_chunks, total_words
     except Exception as stream_err:
         log.exception("Файл %s: ошибка при стриминге: %s", fn, stream_err)
         if is_owner_dm:
@@ -1121,6 +1135,7 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
         # Сохраняем прогресс на случай ошибки (кумулятивный words_sent = words_to_skip + total_words)
         _save_file_progress(chat_id, msg_id, fn, 0, words_to_skip + total_words, 0, total_chunks, file_size,
                            bytes_offset=bytes_to_skip + bytes_downloaded)
+        _active_file_streaming_task = None
         return total_chunks, total_words
 
     # Остаток буфера
@@ -1172,7 +1187,19 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
     if is_owner_dm:
         await safe_send(chat_id, f"✅ {fn}: {total_chunks} чанков отправлено ({total_words} слов)")
 
+    _active_file_streaming_task = None
     return total_chunks, total_words
+
+
+def _cancel_active_file_streaming():
+    """Отменяет текущий стриминг файла, если он запущен."""
+    global _active_file_streaming_task
+    if _active_file_streaming_task and not _active_file_streaming_task.done():
+        _active_file_streaming_task.cancel()
+        log.info("⛔ Активный стриминг файла отменён (task=%s)", _active_file_streaming_task)
+        _active_file_streaming_task = None
+        return True
+    return False
 
 
 async def _resume_file_streaming():
@@ -1760,7 +1787,11 @@ async def cmd_pause(event):
         if not is_owner(event): return
         global _scanning; _scanning = False
         _save_pause_state(True)
-        await safe_send(event.chat_id, "⏸ Пауза.")
+        cancelled = _cancel_active_file_streaming()
+        msg = "⏸ Пауза."
+        if cancelled:
+            msg += " Активный стриминг файла остановлен."
+        await safe_send(event.chat_id, msg)
     except Exception as e:
         log.exception("cmd_pause: %s", e)
 
@@ -1871,6 +1902,8 @@ async def cmd_resetfp(event):
        После этой команды бот забывает все файлы навсегда (до следующей загрузки)."""
     try:
         if not is_owner(event): return
+        # Сначала останавливаем активный стриминг
+        cancelled = _cancel_active_file_streaming()
         await safe_send(event.chat_id, "🔄 Сброс всего прогресса файлов...")
 
         # 1. Помечаем ВСЕ file_progress как неактивные
@@ -1913,11 +1946,15 @@ async def cmd_resetfp(event):
         except Exception as e:
             log.warning("🧹 bot client не смог удалить FPROGRESS: %s", str(e)[:200])
 
+        extras = []
+        if cancelled:
+            extras.append("• Активный стриминг: остановлен")
         await safe_send(event.chat_id,
             f"✅ Прогресс всех файлов сброшен.\n"
             f"• SQLite: помечены неактивными\n"
             f"• Telegram: удалено {removed} FPROGRESS сообщений\n"
-            f"Теперь можно кидать файл заново — начнёт с нуля.")
+            + ("\n".join(extras) + "\n" if extras else "")
+            + "Теперь можно кидать файл заново — начнёт с нуля.")
     except Exception as e:
         log.exception("cmd_resetfp: %s", e)
         await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:200]}")
