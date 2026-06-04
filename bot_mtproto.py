@@ -71,7 +71,12 @@ conn.execute("""CREATE TABLE IF NOT EXISTS file_progress (
     active INTEGER DEFAULT 1,
     checkpoint_msg_id INTEGER,
     updated_at REAL,
+    bytes_offset INTEGER DEFAULT 0,
     PRIMARY KEY (chat_id, msg_id))""")
+try:
+    conn.execute("ALTER TABLE file_progress ADD COLUMN bytes_offset INTEGER DEFAULT 0")
+except sqlite3.OperationalError:
+    pass  # уже есть
 conn.commit()
 
 def wc(text): return len(text.split())
@@ -268,7 +273,7 @@ def _get_active_file_progress():
     """Возвращает активный прогресс отправки файла или None"""
     row = conn.execute(
         "SELECT chat_id, msg_id, filename, total_words, words_sent, "
-        "total_chunks, chunks_sent, file_size, checkpoint_msg_id "
+        "total_chunks, chunks_sent, file_size, checkpoint_msg_id, bytes_offset "
         "FROM file_progress WHERE active=1 ORDER BY updated_at DESC LIMIT 1"
     ).fetchone()
     if not row:
@@ -277,19 +282,20 @@ def _get_active_file_progress():
         'chat_id': row[0], 'msg_id': row[1], 'filename': row[2],
         'total_words': row[3], 'words_sent': row[4],
         'total_chunks': row[5], 'chunks_sent': row[6],
-        'file_size': row[7], 'checkpoint_msg_id': row[8]
+        'file_size': row[7], 'checkpoint_msg_id': row[8],
+        'bytes_offset': row[9] or 0
     }
 
 def _save_file_progress(chat_id, msg_id, filename, total_words, words_sent,
                          total_chunks, chunks_sent, file_size,
-                         checkpoint_msg_id=None):
+                         checkpoint_msg_id=None, bytes_offset=0):
     conn.execute("""INSERT OR REPLACE INTO file_progress 
         (chat_id, msg_id, filename, total_words, words_sent,
-         total_chunks, chunks_sent, file_size, active, checkpoint_msg_id, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,1,?,?)""",
+         total_chunks, chunks_sent, file_size, active, checkpoint_msg_id, updated_at, bytes_offset)
+        VALUES (?,?,?,?,?,?,?,?,1,?,?,?)""",
         (chat_id, msg_id, filename, total_words, words_sent,
          total_chunks, chunks_sent, file_size,
-         checkpoint_msg_id, time.time()))
+         checkpoint_msg_id, time.time(), bytes_offset))
     conn.commit()
 
 def _mark_file_progress_done(chat_id, msg_id):
@@ -301,7 +307,7 @@ def _mark_file_progress_done(chat_id, msg_id):
 # ВНИМАНИЕ: без __префикса — Telegram/markdown интерпретирует __как__ italic!
 _FP_PREFIX = "FPROGRESS\n"
 
-def _build_checkpoint_text(chat_id, msg_id, filename, file_size, total_words, words_sent, active=True):
+def _build_checkpoint_text(chat_id, msg_id, filename, file_size, total_words, words_sent, active=True, bytes_offset=0):
     return (
         f"{_FP_PREFIX}"
         f"chat_id: {chat_id}\n"
@@ -311,6 +317,7 @@ def _build_checkpoint_text(chat_id, msg_id, filename, file_size, total_words, wo
         f"total_words: {total_words}\n"
         f"words_sent: {words_sent}\n"
         f"active: {'1' if active else '0'}\n"
+        f"bytes_offset: {bytes_offset}\n"
     )
 
 def _parse_checkpoint_text(text):
@@ -341,7 +348,11 @@ def _parse_checkpoint_text(text):
             data['words_sent'] = int(line.split(":", 1)[1].strip())
         elif line.startswith("active:"):
             data['active'] = line.split(":", 1)[1].strip() == '1'
+        elif line.startswith("bytes_offset:"):
+            data['bytes_offset'] = int(line.split(":", 1)[1].strip())
     if 'active' in data and data['active'] and 'chat_id' in data and 'msg_id' in data:
+        # bytes_offset опционален (старые чекпойнты без него)
+        data.setdefault('bytes_offset', 0)
         return data
     return None
 
@@ -354,7 +365,8 @@ async def _send_checkpoint(data):
         text = _build_checkpoint_text(
             data['chat_id'], data['msg_id'], data['filename'],
             data['file_size'], data['total_words'], data['words_sent'],
-            active=True
+            active=True,
+            bytes_offset=data.get('bytes_offset', 0) or 0
         )
         old_id = data.get('checkpoint_msg_id')
         if old_id:
@@ -472,12 +484,12 @@ def _build_backup_text():
         lines.append(f"channel_progress={','.join(progress_parts)}")
     # Сохраняем прогресс активного файла (чтобы возобновить после редеплоя)
     fp_row = conn.execute(
-        "SELECT chat_id, msg_id, filename, file_size, words_sent FROM file_progress WHERE active=1 ORDER BY updated_at DESC LIMIT 1"
+        "SELECT chat_id, msg_id, filename, file_size, words_sent, bytes_offset FROM file_progress WHERE active=1 ORDER BY updated_at DESC LIMIT 1"
     ).fetchone()
     if fp_row:
-        fp_chat, fp_msg, fp_fn, fp_size, fp_words = fp_row
+        fp_chat, fp_msg, fp_fn, fp_size, fp_words, fp_bytes = fp_row
         # | как разделитель между полями (не встречается в именах файлов из Telegram)
-        lines.append(f"file_progress={fp_chat}|{fp_msg}|{fp_fn}|{fp_size}|{fp_words}")
+        lines.append(f"file_progress={fp_chat}|{fp_msg}|{fp_fn}|{fp_size}|{fp_words}|{fp_bytes or 0}")
     return "\n".join(lines)
 
 def _parse_backup_lines(text):
@@ -534,17 +546,20 @@ def _parse_backup_lines(text):
             val = line.split("=", 1)[1].strip()
             if val:
                 parts = val.split("|")
-                if len(parts) == 5:
-                    fp_chat, fp_msg, fp_fn, fp_size, fp_words = parts
+                # Формат: chat_id|msg_id|filename|file_size|words_sent[|bytes_offset]
+                if len(parts) >= 5:
+                    fp_chat, fp_msg, fp_fn, fp_size, fp_words = parts[:5]
+                    fp_bytes = int(parts[5]) if len(parts) >= 6 and parts[5].lstrip("-").isdigit() else 0
                     # Валидация: chat_id может быть отрицательным, остальные — цифры
                     if (fp_chat.lstrip("-").isdigit() and fp_msg.isdigit() 
                             and fp_size.isdigit() and fp_words.isdigit()):
                         _save_file_progress(
                             int(fp_chat), int(fp_msg), fp_fn,
                             0, int(fp_words), 0, 0, int(fp_size),
-                            checkpoint_msg_id=None
+                            checkpoint_msg_id=None,
+                            bytes_offset=int(fp_bytes)
                         )
-                        log.info("📦 Восстановлен прогресс файла: %s (слов: %s)", fp_fn, fp_words)
+                        log.info("📦 Восстановлен прогресс файла: %s (слов: %s, байт: %s)", fp_fn, fp_words, fp_bytes)
     conn.commit()
     return True
 
@@ -951,10 +966,32 @@ async def safe_send(chat_id, text, parse_mode="html"):
     except Exception as e:
         log.warning("Не отправилось: %s", e)
 
+# ─── Скачивание документа с произвольного байтового смещения ──────────
+async def _iter_download_from(msg, file_size, offset=0, chunk_size=262144):
+    """Скачивает документ msg чанками, начиная с байта offset, через offset_bytes/limit.
+       Если offset=0 — ведёт себя как обычный iter_download с byte 0."""
+    while offset < file_size:
+        limit = min(chunk_size, file_size - offset)
+        try:
+            chunk = await client.download_media(
+                msg, file=bytes,
+                offset_bytes=offset,
+                limit=limit
+            )
+        except Exception as e:
+            log.warning("_iter_download_from error at offset %d: %s", offset, str(e)[:100])
+            raise
+        if not chunk or len(chunk) == 0:
+            break
+        offset += len(chunk)
+        yield chunk
+
+
 # ─── Стриминг большого .txt файла с возможностью докачки ─────────────────
-async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title, fn, is_owner_dm, words_to_skip=0):
+async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title, fn, is_owner_dm, words_to_skip=0, bytes_to_skip=0):
     """Стримит большой .txt файл через iter_download, с поддержкой resume.
        words_to_skip — сколько слов пропустить (для возобновления после рестарта).
+       bytes_to_skip — сколько байт ПРОПУСТИТЬ с начала файла (начинаем скачку не с 0, а с этой позиции).
        Возвращает (total_chunks_sent, total_words_sent)."""
     doc = msg.document if msg.document else (msg.media.document if msg.media and hasattr(msg.media, 'document') else None)
     if not doc:
@@ -1007,8 +1044,9 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
 
         # Сохраняем прогресс в SQLite (каждые 1 чанк — чтобы при любом рестарте минимум потерь)
         cumulative_words = words_to_skip + total_words
+        cumulative_bytes = bytes_to_skip + bytes_downloaded
         if total_chunks > 0 and total_chunks % 1 == 0:
-            _save_file_progress(chat_id, msg_id, fn, 0, cumulative_words, 0, total_chunks, file_size)
+            _save_file_progress(chat_id, msg_id, fn, 0, cumulative_words, 0, total_chunks, file_size, bytes_offset=cumulative_bytes)
 
         # Чекпойнт в Telegram каждые checkpoint_interval чанков
         if is_owner_dm and total_chunks > 0 and (total_chunks - last_checkpoint_chunks) >= checkpoint_interval:
@@ -1016,6 +1054,7 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
             cp_data = _get_active_file_progress()
             if cp_data:
                 cp_data['words_sent'] = cumulative_words
+                cp_data['bytes_offset'] = cumulative_bytes
                 cp_msg_id = await _send_checkpoint(cp_data)
                 if cp_msg_id:
                     conn.execute(
@@ -1025,13 +1064,14 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
                     conn.commit()
 
     # Создаём/обновляем запись прогресса в SQLite (сохраняем words_to_skip на случай ошибки до первого флаша)
-    _save_file_progress(chat_id, msg_id, fn, 0, words_to_skip, 0, 0, file_size)
+    _save_file_progress(chat_id, msg_id, fn, 0, words_to_skip, 0, 0, file_size, bytes_offset=bytes_to_skip)
 
     # Отправляем чекпойнт в Telegram сразу же — чтобы при редеплое был fallback
     if is_owner_dm:
         cp_data = _get_active_file_progress()
         if cp_data:
             cp_data['words_sent'] = words_to_skip
+            cp_data['bytes_offset'] = bytes_to_skip
             cp_msg_id = await _send_checkpoint(cp_data)
             if cp_msg_id:
                 conn.execute(
@@ -1041,7 +1081,13 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
                 conn.commit()
 
     try:
-        async for chunk in client.iter_download(doc, request_size=262144, file_size=file_size):
+        # Используем ranged download, если есть bytes_to_skip, иначе обычный iter_download
+        if bytes_to_skip > 0:
+            dl_iter = _iter_download_from(msg, file_size, offset=bytes_to_skip)
+        else:
+            dl_iter = client.iter_download(doc, request_size=262144, file_size=file_size)
+
+        async for chunk in dl_iter:
             chunk_buf += chunk
             bytes_downloaded += len(chunk)
             text, chunk_buf = _decode_chunk(chunk_buf)
@@ -1056,19 +1102,27 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
                 if len(word_buffer) >= CHUNK_WORDS:
                     await _flush_chunk()
 
-            if is_owner_dm and time.time() - report_time > 15:
+            # Каждые 15 секунд: статус (если владелец) + сохранение прогресса
+            if time.time() - report_time > 15:
                 report_time = time.time()
-                pct = min(100, bytes_downloaded * 100 // max(1, file_size))
-                await safe_send(chat_id,
-                    f"⏳ {fn}: {bytes_downloaded//1024//1024}MB / {file_size//1024//1024}MB ({pct}%), "
-                    f"отправлено {total_chunks} чанков ({total_words} слов)")
+                cumulative_bytes = bytes_to_skip + bytes_downloaded
+                cumulative_words = words_to_skip + total_words
+                # Сохраняем прогресс ВСЕГДА — даже во время скип-фазы (без чанков)
+                _save_file_progress(chat_id, msg_id, fn, 0, cumulative_words, 0, total_chunks, file_size,
+                                   bytes_offset=cumulative_bytes)
+                if is_owner_dm:
+                    pct = min(100, cumulative_bytes * 100 // max(1, file_size))
+                    await safe_send(chat_id,
+                        f"⏳ {fn}: {cumulative_bytes//1024//1024}MB / {file_size//1024//1024}MB ({pct}%), "
+                        f"отправлено {total_chunks} чанков ({total_words} слов)")
 
     except Exception as stream_err:
         log.exception("Файл %s: ошибка при стриминге: %s", fn, stream_err)
         if is_owner_dm:
             await safe_send(chat_id, f"❌ Ошибка при стриминге {fn}: {str(stream_err)[:200]}")
         # Сохраняем прогресс на случай ошибки (кумулятивный words_sent = words_to_skip + total_words)
-        _save_file_progress(chat_id, msg_id, fn, 0, words_to_skip + total_words, 0, total_chunks, file_size)
+        _save_file_progress(chat_id, msg_id, fn, 0, words_to_skip + total_words, 0, total_chunks, file_size,
+                           bytes_offset=bytes_to_skip + bytes_downloaded)
         return total_chunks, total_words
 
     # Остаток буфера
@@ -1137,7 +1191,8 @@ async def _resume_file_streaming():
                     fp.get('filename', 'unknown.txt'),
                     fp.get('total_words', 0), fp.get('words_sent', 0),
                     0, 0, fp.get('file_size', 0),
-                    fp.get('checkpoint_msg_id')
+                    fp.get('checkpoint_msg_id'),
+                    bytes_offset=fp.get('bytes_offset', 0) or 0
                 )
             else:
                 # Нет прогресса — это нормально (первый запуск, файлов не было)
@@ -1185,10 +1240,12 @@ async def _resume_file_streaming():
         await safe_send(fp['chat_id'],
             f"🔄 Возобновляю отправку файла {fn} ({file_size//1024//1024}MB) с {fp['words_sent']} слов...")
 
+        bytes_to_skip = fp.get('bytes_offset', 0) or 0
         await _stream_file_from_msg(
             file_msg, fp['chat_id'], fp['msg_id'], file_size,
             fn, fn, fn, is_owner_dm,
-            words_to_skip=fp['words_sent']
+            words_to_skip=fp['words_sent'],
+            bytes_to_skip=bytes_to_skip
         )
     except Exception as e:
         log.exception("📂 _resume_file_streaming: необработанная ошибка: %s", e)
@@ -1719,16 +1776,17 @@ async def cmd_resume_file(event):
         await safe_send(event.chat_id, f"❌ Ошибка: {str(e)[:300]}")
 
 async def cmd_setfp(event):
-    """Ручное восстановление прогресса файла: /setfp chat_id msg_id filename file_size words_sent"""
+    """Ручное восстановление прогресса файла: /setfp chat_id msg_id filename file_size words_sent [bytes_offset]"""
     try:
         if not is_owner(event): return
-        parts = event.message.raw_text.strip().split(maxsplit=5)
+        parts = event.message.raw_text.strip().split(maxsplit=6)
         if len(parts) < 6:
             await safe_send(event.chat_id,
-                "❌ Формат: /setfp chat_id msg_id filename file_size words_sent\n"
-                "Пример: /setfp 8587090554 3387 channels_dump.txt 595323474 36000")
+                "❌ Формат: /setfp chat_id msg_id filename file_size words_sent [bytes_offset]\n"
+                "Пример: /setfp 8587090554 3387 channels_dump.txt 595323474 27739200 280000000")
             return
-        _, fp_chat, fp_msg, fp_fn, fp_size, fp_words = parts
+        _, fp_chat, fp_msg, fp_fn, fp_size, fp_words = parts[:6]
+        fp_bytes = int(parts[6]) if len(parts) >= 7 and parts[6].lstrip("-").isdigit() else 0
         if not (fp_chat.lstrip("-").isdigit() and fp_msg.isdigit()
                 and fp_size.isdigit() and fp_words.isdigit()):
             await safe_send(event.chat_id, "❌ chat_id, msg_id, file_size, words_sent должны быть числами")
@@ -1736,10 +1794,11 @@ async def cmd_setfp(event):
         _save_file_progress(
             int(fp_chat), int(fp_msg), fp_fn,
             0, int(fp_words), 0, 0, int(fp_size),
-            checkpoint_msg_id=None
+            checkpoint_msg_id=None,
+            bytes_offset=int(fp_bytes)
         )
         await safe_send(event.chat_id,
-            f"✅ Прогресс сохранён: {fp_fn}, words_sent={fp_words}\n"
+            f"✅ Прогресс сохранён: {fp_fn}, words_sent={fp_words}, bytes_offset={fp_bytes}\n"
             f"Запускаю возобновление...")
         asyncio.create_task(_resume_file_streaming())
     except Exception as e:
