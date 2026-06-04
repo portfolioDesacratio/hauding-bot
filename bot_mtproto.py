@@ -966,27 +966,6 @@ async def safe_send(chat_id, text, parse_mode="html"):
     except Exception as e:
         log.warning("Не отправилось: %s", e)
 
-# ─── Скачивание документа с произвольного байтового смещения ──────────
-async def _iter_download_from(msg, file_size, offset=0, chunk_size=262144):
-    """Скачивает документ msg чанками, начиная с байта offset, через offset_bytes/limit.
-       Если offset=0 — ведёт себя как обычный iter_download с byte 0."""
-    while offset < file_size:
-        limit = min(chunk_size, file_size - offset)
-        try:
-            chunk = await client.download_media(
-                msg, file=bytes,
-                offset_bytes=offset,
-                limit=limit
-            )
-        except Exception as e:
-            log.warning("_iter_download_from error at offset %d: %s", offset, str(e)[:100])
-            raise
-        if not chunk or len(chunk) == 0:
-            break
-        offset += len(chunk)
-        yield chunk
-
-
 # ─── Стриминг большого .txt файла с возможностью докачки ─────────────────
 async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title, fn, is_owner_dm, words_to_skip=0, bytes_to_skip=0):
     """Стримит большой .txt файл через iter_download, с поддержкой resume.
@@ -1081,11 +1060,9 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
                 conn.commit()
 
     try:
-        # Используем ranged download, если есть bytes_to_skip, иначе обычный iter_download
-        if bytes_to_skip > 0:
-            dl_iter = _iter_download_from(msg, file_size, offset=bytes_to_skip)
-        else:
-            dl_iter = client.iter_download(doc, request_size=262144, file_size=file_size)
+        # iter_download поддерживает offset — используем его вместо скачивания с 0
+        # Если bytes_to_skip=0, ведёт себя как обычный iter_download
+        dl_iter = client.iter_download(doc, offset=bytes_to_skip, request_size=262144, file_size=file_size)
 
         async for chunk in dl_iter:
             chunk_buf += chunk
