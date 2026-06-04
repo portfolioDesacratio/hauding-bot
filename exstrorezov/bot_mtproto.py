@@ -443,12 +443,26 @@ async def _find_latest_checkpoint(owner_id):
     return None
 
 async def _delete_checkpoint(chat_id, msg_id):
-    """Удаляет сообщение-чекпойнт"""
-    if msg_id:
-        try:
-            await client.delete_messages(chat_id, msg_id)
-        except Exception:
-            pass
+    """Удаляет сообщение-чекпойнт через оба клиента (bot + user) с протоколированием"""
+    if not msg_id:
+        return
+    # Пробуем bot client
+    try:
+        await client.delete_messages(chat_id, msg_id)
+        log.info("🗑️ Чекпойнт #%s удалён (bot client)", msg_id)
+        return
+    except Exception as e:
+        log.warning("🗑️ bot client не смог удалить чекпойнт #%s: %s", msg_id, str(e)[:200])
+    # Fallback: user client
+    try:
+        uc = get_user_client()
+        if uc and uc.is_connected():
+            await uc.delete_messages(chat_id, msg_id)
+            log.info("🗑️ Чекпойнт #%s удалён (user client)", msg_id)
+        else:
+            log.warning("🗑️ User client недоступен, чекпойнт #%s не удалён", msg_id)
+    except Exception as e:
+        log.warning("🗑️ user client тоже не смог удалить чекпойнт #%s: %s", msg_id, str(e)[:200])
 
 session_path = str(DATA_DIR / "mt_session")
 client = TelegramClient(session_path, API_ID, API_HASH)
@@ -819,7 +833,10 @@ _send_lock = asyncio.Lock()
 async def send_to_output(text, source_title=None, source_link=None, force=False):
     global _last_send_time, _SENT_HASHES
     out = get_output_chat()
-    if not out: return
+    if not out:
+        log.warning("⚠️ Канал вывода не назначен — сообщение не отправлено (force=%s, text_len=%d)",
+                     force, len(text) if text else 0)
+        return
     if not _scanning and not force:
         log.debug("⏸ Пауза: send_to_output пропущен (force=%s)", force)
         return
@@ -1106,13 +1123,30 @@ async def _stream_file_from_msg(msg, chat_id, msg_id, file_size, filename, title
         (chat_id, msg_id)
     ).fetchone()
     if cp and cp[0]:
+        done_text = _build_checkpoint_text(
+            chat_id, msg_id, fn, file_size, total_words, total_words, active=False
+        )
+        # Пробуем отредактировать чекпойнт (active=0) через bot client
+        edited = False
         try:
-            done_text = _build_checkpoint_text(
-                chat_id, msg_id, fn, file_size, total_words, total_words, active=False
-            )
             await client.edit_message(chat_id, cp[0], done_text)
-        except Exception:
-            pass
+            edited = True
+            log.info("🗑️ Чекпойнт #%s отредактирован (active=0) через bot client", cp[0])
+        except Exception as e:
+            log.warning("🗑️ bot client edit чекпойнта #%s: %s", cp[0], str(e)[:200])
+        # Fallback: user client
+        if not edited:
+            try:
+                uc = get_user_client()
+                if uc and uc.is_connected():
+                    await uc.edit_message(chat_id, cp[0], done_text)
+                    edited = True
+                    log.info("🗑️ Чекпойнт #%s отредактирован через user client", cp[0])
+                else:
+                    log.warning("🗑️ User client недоступен, чекпойнт #%s не отредактирован", cp[0])
+            except Exception as e:
+                log.warning("🗑️ user client edit чекпойнта #%s: %s", cp[0], str(e)[:200])
+        # Удаляем чекпойнт (через оба клиента)
         await _delete_checkpoint(chat_id, cp[0])
 
     if is_owner_dm:
@@ -1163,6 +1197,20 @@ async def _resume_file_streaming():
         if not fp:
             return
 
+        # Проверка: не завершён ли уже файл? (bytes_offset >= file_size)
+        fp_bytes = fp.get('bytes_offset', 0) or 0
+        fp_size = fp.get('file_size', 0) or 0
+        if fp_size > 0 and fp_bytes >= fp_size:
+            log.info("📂 Файл %s уже полностью отправлен (bytes_offset=%d >= file_size=%d), "
+                     "очищаю чекпойнт", fp.get('filename','?'), fp_bytes, fp_size)
+            await safe_send(OWNER_ID,
+                f"⏭️ Файл {fp.get('filename','?')} уже полностью отправлен, "
+                f"чекпойнт будет очищен")
+            if fp.get('checkpoint_msg_id'):
+                await _delete_checkpoint(fp['chat_id'], fp['checkpoint_msg_id'])
+            _mark_file_progress_done(fp['chat_id'], fp['msg_id'])
+            return
+
         # Сообщаем владельцу что нашли
         try:
             await safe_send(OWNER_ID,
@@ -1202,12 +1250,20 @@ async def _resume_file_streaming():
             f"🔄 Возобновляю отправку файла {fn} ({file_size//1024//1024}MB) с {fp['words_sent']} слов...")
 
         bytes_to_skip = fp.get('bytes_offset', 0) or 0
-        await _stream_file_from_msg(
+        total_chunks, total_words = await _stream_file_from_msg(
             file_msg, fp['chat_id'], fp['msg_id'], file_size,
             fn, fn, fn, is_owner_dm,
             words_to_skip=fp['words_sent'],
             bytes_to_skip=bytes_to_skip
         )
+        # Если файл не содержал новых слов — чистим чекпойнт и помечаем завершённым
+        if total_chunks == 0 and total_words == 0:
+            log.info("📂 Файл %s не содержит новых слов (0 чанков). Чищу чекпойнт.", fn)
+            if fp.get('checkpoint_msg_id'):
+                await _delete_checkpoint(fp['chat_id'], fp['checkpoint_msg_id'])
+            _mark_file_progress_done(fp['chat_id'], fp['msg_id'])
+            await safe_send(OWNER_ID,
+                f"⏭️ Файл {fn} уже полностью отправлен, чекпойнт очищен")
     except Exception as e:
         log.exception("📂 _resume_file_streaming: необработанная ошибка: %s", e)
         try:
@@ -1725,6 +1781,18 @@ async def cmd_resume_file(event):
                 f"✅ Чекпойнт найден: {cp.get('filename','?')}, "
                 f"words_sent={cp.get('words_sent','?')}, "
                 f"active={cp.get('active','?')}")
+            # Проверка: не завершён ли файл?
+            cp_bytes = cp.get('bytes_offset', 0) or 0
+            cp_size = cp.get('file_size', 0) or 0
+            if cp_size > 0 and cp_bytes >= cp_size:
+                await safe_send(event.chat_id,
+                    f"⏭️ Файл уже полностью отправлен (bytes_offset={cp_bytes} >= file_size={cp_size}). "
+                    f"Чищу чекпойнт...")
+                if cp.get('checkpoint_msg_id'):
+                    await _delete_checkpoint(cp['chat_id'], cp['checkpoint_msg_id'])
+                _mark_file_progress_done(cp['chat_id'], cp['msg_id'])
+                await safe_send(event.chat_id, "✅ Чекпойнт очищен, возобновление не требуется")
+                return
             # Запускаем стриминг в фоне (чтобы не блокировать хендлер часами)
             await safe_send(event.chat_id, "🔄 Запускаю возобновление отправки в фоне...")
             asyncio.create_task(_resume_file_streaming())
@@ -2896,7 +2964,10 @@ async def main():
         # 7. Уведомление владельцам
         restored_settings = []
         out_ch = get_output_chat()
-        if out_ch: restored_settings.append(f"📤 Канал вывода: {out_ch}")
+        if out_ch:
+            restored_settings.append(f"📤 Канал вывода: {out_ch}")
+        else:
+            restored_settings.append("⚠️ <b>Канал вывода НЕ НАСТРОЕН</b> — отправь /set_output в ЛС")
         kw = conn.execute("SELECT value FROM config WHERE key='user_search_keywords'").fetchone()
         if kw: restored_settings.append(f"🔍 Ключевые слова: {kw[0][:60]}...")
         auto = conn.execute("SELECT value FROM config WHERE key='user_autosearch'").fetchone()
